@@ -216,3 +216,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project: data and model artifacts
+data/*
+!data/processed
+data/processed/*
+!data/processed/manifest.csv
+models/
+checkpoints/
+runs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# FiftyOne cache
+.fiftyone/
+fiftyone/
+
+# Local Claude config
+.claude/settings.local.json
+CLAUDE.local.md
