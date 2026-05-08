@@ -19,13 +19,13 @@ Early stage. Data pipeline is scaffolded; model, training loop, and evaluation a
 
 ## Data Pipeline
 
-**Source:** [Open Images V7](https://storage.googleapis.com/openimages/web/index.html), 100K random sample from the train split (CC BY 2.0 images, free for ML use).
+**Source:** [Open Images V7](https://storage.googleapis.com/openimages/web/index.html), 100K random sample from the train split (CC BY 2.0 images, free for ML use). Images are downloaded from the [CVDF S3 mirror](https://github.com/cvdfoundation/open-images-dataset) (free, public, no AWS account required) — much faster and more reliable than fetching individual Flickr URLs.
 
 **Working resolution:** 256×256. Train at this size; at inference, predict `ab` at 256×256 then upsample chrominance and recombine with the original full-resolution `L` channel.
 
 **Pipeline:**
 
-1. `scripts/download_dataset.py` — uses FiftyOne to pull a random 100K subset (no labels) into `data/raw/`.
+1. `scripts/download_dataset.py` — async httpx downloader pulling from the S3 mirror with high concurrency. Skips images already on disk and migrates any leftovers from a previous FiftyOne run. Uses FiftyOne's locally cached `image_ids.csv` for the master ID list (sample seed-42, 100K).
 2. `scripts/preprocess_images.py` — filters out grayscale photos, center-crops to square, resizes to 256×256 JPEG (q=90), splits 80/10/10 into `data/processed/{train,val,test}/`, writes `manifest.csv`.
 3. `src/data/dataset.py` — `ColorizationDataset` reads the manifest, converts RGB→LAB at runtime, returns `(L, ab)` tensors normalized to `[-1, 1]`.
 

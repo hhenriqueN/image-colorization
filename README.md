@@ -22,7 +22,9 @@ This creates a `.venv/` and installs all dependencies pinned by `uv.lock`. Run s
 
 ## Downloading the dataset
 
-We train on a 100K-image subset of [Open Images V7](https://storage.googleapis.com/openimages/web/index.html) (CC BY 2.0, free for ML use). The download script has two modes — pick the one that matches your situation.
+We train on a 100K-image subset of [Open Images V7](https://storage.googleapis.com/openimages/web/index.html) (CC BY 2.0, free for ML use). Images come from the [CVDF S3 mirror](https://github.com/cvdfoundation/open-images-dataset) — a free, public, no-account-required bucket hosted by a non-profit. The downloader uses async httpx with high concurrency, so 100K images typically finishes in under an hour.
+
+The download script has two modes — pick the one that matches your situation.
 
 ### Group members: download the exact pinned dataset
 
