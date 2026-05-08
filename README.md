@@ -47,6 +47,24 @@ rm -rf data/raw/
 
 If you ever need it back, just re-run step 3.
 
+## Training pipeline
+
+Three phases of increasing quality. Each has its own notebook under `notebooks/`.
+
+| Phase | Notebook | Architecture | Loss | Dependency |
+|---|---|---|---|---|
+| 1 | `01_unet.ipynb` | U-Net from scratch | L1 | None — independent baseline |
+| 2 | `02_resnet_unet.ipynb` | ResNet-34 encoder + U-Net decoder | L1 + Perceptual | None — uses ImageNet weights |
+| 3 | `03_cgan.ipynb` | Phase 2 generator + PatchGAN discriminator | L1 + Perceptual + Adversarial | Requires Phase 2 `best.pth` |
+
+**Phase 1** trains everything from scratch with a pixel-level L1 loss. Learns correct spatial structure (where colors go) but produces desaturated outputs — L1 pushes the model toward the mean color rather than a vivid prediction. Useful as a baseline.
+
+**Phase 2** replaces the encoder with a frozen ResNet-34 pretrained on ImageNet, giving the decoder rich semantic features from epoch 1. A VGG perceptual loss adds a high-level structural signal on top of L1. Convergence is 3–5× faster; colors are better saturated and more accurately localized.
+
+**Phase 3** adds a PatchGAN discriminator that scores each 70×70 patch as real or fake. The adversarial loss forces the generator to produce locally convincing colors, eliminating the muddy averaged outputs from L1 alone. The generator is initialized from Phase 2 weights for stable GAN training.
+
+Checkpoints are saved to `checkpoints/<phase>/` (gitignored). To run Phase 3, point `PHASE2_CHECKPOINT` in `03_cgan.ipynb` at the Phase 2 `best.pth` before starting.
+
 ## Project layout
 
 ```
@@ -56,12 +74,23 @@ image-colorization/
 │   └── processed/
 │       ├── train/  val/  test/    # 256x256 JPEGs
 │       └── manifest.csv           # tracked in git for reproducibility
+├── notebooks/
+│   ├── 01_unet.ipynb              # Phase 1 training & evaluation
+│   ├── 02_resnet_unet.ipynb       # Phase 2 training & evaluation
+│   └── 03_cgan.ipynb              # Phase 3 training & evaluation
 ├── scripts/
 │   ├── download_dataset.py        # async S3 downloader (manifest-pinned or random)
 │   └── preprocess_images.py       # filter B&W, resize, split
 ├── src/
-│   └── data/
-│       └── dataset.py             # ColorizationDataset (RGB→LAB)
+│   ├── data/
+│   │   └── dataset.py             # ColorizationDataset (RGB→LAB)
+│   ├── losses/
+│   │   └── perceptual.py          # VGG-16 perceptual loss (differentiable LAB→RGB)
+│   └── models/
+│       ├── unet.py                # Phase 1: vanilla U-Net
+│       ├── resnet_unet.py         # Phase 2: ResNet-34 encoder + U-Net decoder
+│       └── discriminator.py       # Phase 3: 70×70 PatchGAN discriminator
+├── checkpoints/                   # gitignored — saved during training
 ├── pyproject.toml                 # deps + project config (uv-managed)
 └── .python-version                # pinned to 3.12
 ```
