@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import random
 from pathlib import Path
 
@@ -60,12 +61,21 @@ def square_resize(img: Image.Image, size: int) -> Image.Image:
     return cropped.resize((size, size), Image.Resampling.LANCZOS)
 
 
-def assign_split(index: int, total: int) -> str:
-    train_end = int(total * SPLIT_RATIOS["train"])
-    val_end = train_end + int(total * SPLIT_RATIOS["val"])
-    if index < train_end:
+SPLIT_BUCKETS = 100
+
+
+def assign_split(image_id: str) -> str:
+    """Deterministically assign a split based on a hash of the image ID.
+
+    Independent of processing order or grayscale-rejection rate, so the
+    final 80/10/10 ratios hold over all kept images, not over the raw count.
+    """
+    bucket = int(hashlib.sha256(image_id.encode()).hexdigest()[:8], 16) % SPLIT_BUCKETS
+    train_cutoff = int(SPLIT_RATIOS["train"] * SPLIT_BUCKETS)
+    val_cutoff = train_cutoff + int(SPLIT_RATIOS["val"] * SPLIT_BUCKETS)
+    if bucket < train_cutoff:
         return "train"
-    if index < val_end:
+    if bucket < val_cutoff:
         return "val"
     return "test"
 
@@ -114,8 +124,8 @@ def main() -> None:
                 skipped_error += 1
                 continue
 
-            split = assign_split(kept, len(raw_paths))
             out_name = f"{src_path.stem}.jpg"
+            split = assign_split(src_path.stem)
             out_path = args.out_dir / split / out_name
             processed.save(out_path, format="JPEG", quality=JPEG_QUALITY)
             writer.writerow([out_name, split, str(src_path), original_size[0], original_size[1]])
