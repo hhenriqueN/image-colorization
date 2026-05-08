@@ -222,7 +222,6 @@ data/*
 !data/processed
 data/processed/*
 !data/processed/manifest.csv
-models/
 checkpoints/
 runs/
 wandb/
