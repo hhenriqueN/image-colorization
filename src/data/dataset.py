@@ -6,6 +6,7 @@ Reads a manifest produced by scripts/preprocess_images.py and yields
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Literal
 
@@ -37,14 +38,27 @@ class ColorizationDataset(Dataset):
         split: Split,
         processed_dir: Path = DEFAULT_PROCESSED_DIR,
         horizontal_flip: bool = True,
+        filenames: Iterable[str] | None = None,
     ) -> None:
+        """
+        filenames: optional iterable of manifest filenames to restrict this
+        dataset to a subset (e.g. when training on a fraction of the data).
+        Filenames not present in the manifest for the given split are ignored.
+        """
         manifest = pd.read_csv(processed_dir / "manifest.csv")
-        self.entries = manifest[manifest["split"] == split].reset_index(drop=True)
+        entries = manifest[manifest["split"] == split]
+        if filenames is not None:
+            wanted = set(filenames)
+            entries = entries[entries["filename"].isin(wanted)]
+        self.entries = entries.reset_index(drop=True)
         self.split_dir = processed_dir / split
         self.horizontal_flip = horizontal_flip and split == "train"
 
         if len(self.entries) == 0:
-            raise ValueError(f"No entries for split '{split}' in {processed_dir}/manifest.csv")
+            raise ValueError(
+                f"No entries for split '{split}' in {processed_dir}/manifest.csv"
+                + (" matching the given filenames" if filenames is not None else "")
+            )
 
     def __len__(self) -> int:
         return len(self.entries)
