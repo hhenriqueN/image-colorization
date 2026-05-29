@@ -255,13 +255,162 @@ break the sepia ceiling permanently but require new loss code.
 
 ---
 
+# Phase C — classification reformulation (Zhang et al. 2016)
+
+We implemented next-step #6 from the "what to try next" list. Inspired by
+the Medium post the user shared, which is a tutorial on running Zhang et al.'s
+pretrained Caffe weights via OpenCV — we didn't use those weights; we
+reimplemented the *technique* in our PyTorch code so we'd have a model we
+trained ourselves.
+
+The core idea: don't regress ab — *classify* it. Discretize the ab plane into
+a small set of bins, have the model output a per-pixel probability over
+those bins, train with cross-entropy weighted to upweight rare colors, and
+at inference reconstruct ab via an annealed-mean over the bin centers. This
+sidesteps the L1 attractor (which always wants the mean color, ≈ sepia) by
+removing L1 from the loss entirely.
+
+## Bin quantization
+
+Computed our own ab gamut from a 5,000-image sample of our training data —
+not Zhang's `pts_in_hull.npy` — so the bins reflect Open Images' actual
+distribution. With a 5-LAB-unit grid over `[-110, 110]` and a 0.001 % minimum
+population threshold, we kept **214 bins out of 1,936 cells** (`scripts/
+precompute_classification_priors.py`). The gamut is a long diagonal stripe in
+ab space (`data/processed/bin_priors.png`) — most natural images live on the
+warm/cool color axis, so the model only needs to discriminate among ~214
+realistic colors rather than the full 1,936 grid.
+
+Rebalance weights computed via Zhang's formula
+`w(q) ∝ 1 / ((1-λ) p̂(q) + λ/Q)` with λ=0.5, normalized so the weighted
+prior sums to 1. Final weights spanned 0.13 (most common bins, near gray) to
+6.45 (rarest saturated bins) — about a 50× boost for rare colors during
+training.
+
+## Architecture & training
+
+| Item | Value |
+|---|---|
+| Encoder | Frozen ImageNet ResNet-34 (same as Phase A/B) |
+| Decoder | U-Net (same as Phase A/B) |
+| Output head | `ConvTranspose2d(128, 214)` with no activation (vs Phase A's 2 + Tanh) |
+| Loss | `nn.CrossEntropyLoss(weight=rebalance_weights)` over (N, 214, H, W) logits |
+| Warm start | `checkpoints/cgan_run01/best_generator.pth` (Phase B best); only the new 214-channel output head was random-init |
+| Train subset | 25,000 / 74,919 |
+| Val subset | 500 |
+| Batch | 16 |
+| Epochs | 10 |
+| LR | 3e-4 with cosine decay from epoch 5 |
+| Grad clip | 1.0 |
+| Wall time | **~6 h 50 min** (~25 min/epoch on M4, vs ~9 min/epoch for Phase A) |
+
+Inference: `annealed_mean(logits, bin_centers, T)` — log-softmax, divide by
+`T`, softmax, weighted average over bin centers. **T was the saturation knob.**
+
+## Metrics
+
+```
+ep  1: train_ce=3.6318  val_ce=3.5136  val_l1=0.0791  *
+ep  2: train_ce=3.4976  val_ce=3.4553  val_l1=0.0790  *
+ep  3: train_ce=3.4707  val_ce=3.4430  val_l1=0.0784  *
+ep  4: train_ce=3.4546  val_ce=3.4396  val_l1=0.0775  *
+ep  5: train_ce=3.4383  val_ce=3.4232  val_l1=0.0779  *  ← LR decay starts
+ep  6: train_ce=3.4272  val_ce=3.4150  val_l1=0.0781  *
+ep  7: train_ce=3.4120  val_ce=3.3975  val_l1=0.0770  *
+ep  8: train_ce=3.3953  val_ce=3.4054  val_l1=0.0777
+ep  9: train_ce=3.3741  val_ce=3.3868  val_l1=0.0780  *
+ep 10: train_ce=3.3611  val_ce=3.3830  val_l1=0.0775  *  ← best.pth
+```
+
+Final `val_l1=0.0775` on the annealed-mean output at training-time T=0.38,
+slightly better than Phase B's `0.0800` — a 3 % L1 win, plus the
+qualitative win below.
+
+## The temperature finding
+
+T=0.38 (Zhang's default for his 313-bin gamut) gave Phase C samples that
+looked almost identical to Phase B's — still muted. The training metrics
+hadn't proven that classification was a real upgrade.
+
+**T=0.20 changed everything.** Same trained weights, just a lower softmax
+temperature at inference → the annealed-mean concentrates on the
+highest-probability bins instead of spreading over many → the output stops
+being a weighted-average-of-colors (sepia) and starts being a confident
+single-color guess (vivid).
+
+Visible on the 8 held-out comparison images:
+- **Capitol-style building** — sepia at T=0.38 → blue sky and warm building
+  tones at T=0.20. Phase A and Phase B both miss this.
+- **Apple close-up** — washed brown at T=0.38 → vivid red at T=0.20.
+- **Zebra-print chair** — muted at T=0.38 → yellow + red tones at T=0.20.
+- **Boats** — gray-tan at T=0.38 → cyan water at T=0.20.
+
+T=0.10 is even more vivid but starts to show patchiness (discrete-bin
+artifacts where adjacent pixels jump between bins). T=0.20 is the
+right tradeoff and is what `04_compare_results.ipynb` now uses.
+
+This is precisely the Zhang-attractor-breaker effect we couldn't get from
+adversarial training in Phase B.
+
+## What still doesn't work
+
+- **214 bins is coarse** — bin width is 5 LAB units, so the model can't
+  represent fine color gradations within a single bin. With 313+ bins (a
+  finer grid) we'd get smoother gradients.
+- **Patchiness at low T** — discrete-bin artifacts. Zhang addressed this in
+  his original paper with a bilateral filter post-processing step; we
+  haven't implemented that.
+- **The metric story is muddled** — `val_l1` improved only 3 %, which is
+  not what an undergraduate course rubric would call a dramatic gain.
+  Visual quality is genuinely better but if you're being scored on a single
+  number, Phase C looks marginal. The right framing is: "Phase C *finally
+  gets specific colors right* on inputs where A/B unfailingly produced
+  sepia." Pure L1 numbers don't capture that.
+
+## What worked well
+
+- **Warm-starting from Phase B's weights** kept the spatial-structure quality
+  from L1+perceptual training while the new classification head learned to
+  emit distributions instead of point estimates. Convergence was reasonable
+  in 10 epochs.
+- **Computing our own gamut** (not using Zhang's ImageNet pts_in_hull) gave
+  a tighter, dataset-matched bin set. The Open Images distribution is
+  mostly nature/people, not Zhang's broader ImageNet, so a smaller
+  data-fitted gamut was the right call.
+- **The MPS NaN fix from Phase A** carried over — no new numerical issues
+  in cross-entropy training.
+
+## Next steps if we keep iterating
+
+In order:
+1. **Bilateral filter post-processing** on the annealed-mean output to kill
+   the patchiness at low T. Cheapest visible quality bump.
+2. **Finer bin grid (step 4, ~350 bins)** for smoother color gradations.
+3. **Drop the warm-start** and train Phase C from a Phase-A-warm start
+   instead — the cGAN's bias may be pulling the classification head toward
+   conservative outputs.
+4. **Train on the full 75 K images** for ≥ 20 epochs. Phase C with a
+   bigger dataset should generalize better to the rare-color tail that
+   rebalancing tries to upweight.
+
+---
+
 ## Files / artifacts to look at
 
 - Checkpoints (gitignored):
   `checkpoints/resnet_unet_run03/best.pth` (Phase A best, val_l1=0.0834)
   `checkpoints/cgan_run01/best_generator.pth` (Phase B best, val_l1=0.0800)
-- Comparison notebook: `notebooks/04_compare_results.ipynb` (already
-  executed with embedded plots and images, ~21 MB)
+  `checkpoints/cls_run01/best.pth` (Phase C best, val_l1=0.0775 @ T=0.38)
+- Phase C priors (gitignored):
+  `data/processed/ab_bin_centers.npy` (214 × 2)
+  `data/processed/ab_rebalance_weights.npy` (214,)
+  `data/processed/bin_priors.png` (gamut heatmap, sanity check)
+- Comparison notebook: `notebooks/04_compare_results.ipynb`
+  (now includes Phase C as a 4th model column, executed in-place)
 - Per-epoch training sample grids: `outputs/samples/{run_name}/epoch_NNN.png`
+- Phase C temperature comparisons:
+  `outputs/samples/cls_run01/best_T038.png` (default, muted)
+  `outputs/samples/cls_run01/best_T020.png` (sweet spot, vivid + clean)
+  `outputs/samples/cls_run01/best_T010.png` (most vivid, some patchiness)
 - Per-run metrics: `checkpoints/{run_name}/log.jsonl` (one JSON object per
   epoch)
