@@ -1,14 +1,18 @@
 """Headless training script for image colorization.
 
-Supports two model paths:
-  - resnet_unet : ResNet-34 encoder (frozen by default) + U-Net decoder
-                  Loss = L1 + lambda_perceptual * VGG-perceptual
-  - cgan        : Same generator + PatchGAN discriminator
-                  Loss = L1 + lambda_perceptual * VGG + lambda_adv * LSGAN
+Supports three model paths:
+  - resnet_unet     : ResNet-34 encoder (frozen by default) + U-Net decoder
+                      Loss = L1 + lambda_perceptual * VGG-perceptual
+  - cgan            : Same generator + PatchGAN discriminator
+                      Loss = L1 + lambda_perceptual * VGG + lambda_adv * LSGAN
+  - resnet_unet_cls : Same encoder/decoder, but the final layer outputs Q logits
+                      per pixel (Zhang-style classification). Loss = weighted
+                      cross-entropy over precomputed ab bins. Best.pth is
+                      tracked by val_ce; val_l1 (annealed-mean) is also logged.
 
 Designed to run in the background. Writes progress to a JSONL log file
 in the checkpoint dir, prints sparse human-readable lines to stdout,
-and saves best.pth (lowest val_l1_ab) and last.pth every epoch.
+and saves best.pth and last.pth every epoch.
 
 Examples:
     uv run python scripts/train.py \\
@@ -21,6 +25,12 @@ Examples:
         --batch-size 8 --epochs 8 \\
         --warm-start checkpoints/resnet_unet_run01/best.pth \\
         --checkpoint-dir checkpoints/cgan_run01
+
+    uv run python scripts/train.py \\
+        --model resnet_unet_cls --train-subset 25000 --val-subset 500 \\
+        --batch-size 16 --epochs 10 --lr 3e-4 \\
+        --warm-start checkpoints/cgan_run01/best_generator.pth \\
+        --checkpoint-dir checkpoints/cls_run01
 """
 
 from __future__ import annotations
@@ -47,12 +57,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import (  # noqa: E402
+    AB_MAX,
     DEFAULT_PROCESSED_DIR,
     ColorizationDataset,
+    lab_to_rgb,
 )
+from src.data.quantize import ab_to_class, annealed_mean  # noqa: E402
 from src.losses.perceptual import PerceptualLoss  # noqa: E402
 from src.models.discriminator import PatchGANDiscriminator  # noqa: E402
 from src.models.resnet_unet import ResNetUNet  # noqa: E402
+from src.models.resnet_unet_cls import ResNetUNetClassifier  # noqa: E402
 
 import scripts.generate_samples as samples_module  # noqa: E402
 
@@ -79,11 +93,14 @@ class TrainConfig:
     resume: Path | None
     warm_start: Path | None
     device_str: str | None
+    temperature: float
+    bin_centers_path: Path
+    rebalance_weights_path: Path
 
 
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser(description="Train colorizer")
-    p.add_argument("--model", choices=["resnet_unet", "cgan"], default="resnet_unet")
+    p.add_argument("--model", choices=["resnet_unet", "cgan", "resnet_unet_cls"], default="resnet_unet")
     p.add_argument("--train-subset", type=int, default=3000)
     p.add_argument("--val-subset", type=int, default=500)
     p.add_argument("--batch-size", type=int, default=16)
@@ -109,6 +126,14 @@ def parse_args() -> TrainConfig:
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--warm-start", type=Path, default=None)
     p.add_argument("--device", default=None, help="cpu | mps | cuda (default: auto)")
+    p.add_argument("--temperature", type=float, default=0.38,
+                   help="Annealed-mean softmax temperature for resnet_unet_cls (Zhang's 0.38).")
+    p.add_argument("--bin-centers", type=Path,
+                   default=DEFAULT_PROCESSED_DIR / "ab_bin_centers.npy",
+                   help="Path to precomputed ab bin centers (Q,2 npy).")
+    p.add_argument("--rebalance-weights", type=Path,
+                   default=DEFAULT_PROCESSED_DIR / "ab_rebalance_weights.npy",
+                   help="Path to precomputed class rebalance weights (Q,) npy.")
     args = p.parse_args()
 
     return TrainConfig(
@@ -132,6 +157,9 @@ def parse_args() -> TrainConfig:
         resume=args.resume,
         warm_start=args.warm_start,
         device_str=args.device,
+        temperature=args.temperature,
+        bin_centers_path=args.bin_centers,
+        rebalance_weights_path=args.rebalance_weights,
     )
 
 
@@ -591,6 +619,227 @@ def train_cgan(cfg: TrainConfig, device: torch.device) -> None:
     print(f"[train-cgan] finished. Best val_l1={best_val_l1:.4f}. Checkpoints at {cfg.checkpoint_dir}")
 
 
+# ----------------------------------------------------------------------------
+# Phase C: ResNetUNet classifier training (Zhang-style)
+# ----------------------------------------------------------------------------
+
+
+def _annealed_mean_normalized(
+    logits: torch.Tensor,
+    bin_centers_lab: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Annealed-mean (LAB units) → renormalized to [-1, 1] for downstream LAB→RGB."""
+    ab_lab = annealed_mean(logits, bin_centers_lab, temperature=temperature)
+    return ab_lab / AB_MAX
+
+
+@torch.no_grad()
+def _cls_sample_grid(
+    model: ResNetUNetClassifier,
+    dataset: ColorizationDataset,
+    indices: list[int],
+    device: torch.device,
+    bin_centers_lab: torch.Tensor,
+    temperature: float,
+) -> "np.ndarray":
+    """Reuse generate_samples.build_sample_grid logic but route through annealed-mean."""
+    rows = []
+    model.eval()
+    for idx in indices:
+        l_tensor, ab_true = dataset[idx]
+        l_in = l_tensor.unsqueeze(0).to(device)
+        logits = model(l_in)
+        ab_pred = _annealed_mean_normalized(logits, bin_centers_lab, temperature).cpu().squeeze(0).clamp(-1, 1)
+
+        gray_panel = samples_module._grayscale_rgb_from_l(l_tensor)
+        pred_panel = lab_to_rgb(l_tensor, ab_pred)
+        true_panel = lab_to_rgb(l_tensor, ab_true)
+        rows.append(samples_module._hstack_with_separator([gray_panel, pred_panel, true_panel]))
+    return samples_module._vstack_with_separator(rows)
+
+
+def train_resnet_unet_cls(cfg: TrainConfig, device: torch.device) -> None:
+    cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_path = cfg.checkpoint_dir / "log.jsonl"
+
+    if not cfg.bin_centers_path.exists():
+        raise FileNotFoundError(
+            f"Bin centers not found at {cfg.bin_centers_path}. "
+            f"Run scripts/precompute_classification_priors.py first."
+        )
+    bin_centers_lab = torch.from_numpy(np.load(cfg.bin_centers_path)).to(torch.float32).to(device)
+    rebalance_weights = torch.from_numpy(np.load(cfg.rebalance_weights_path)).to(torch.float32).to(device)
+    num_classes = bin_centers_lab.shape[0]
+    print(f"[train-cls] num_classes={num_classes} bin_centers={cfg.bin_centers_path.name} "
+          f"weights mean={rebalance_weights.mean().item():.3f}")
+
+    if cfg.warm_start is not None:
+        model = ResNetUNetClassifier.from_regression_checkpoint(
+            cfg.warm_start, num_classes=num_classes,
+            freeze_encoder=cfg.freeze_encoder, map_location=device,
+        ).to(device)
+        print(f"[train-cls] warm-started encoder/decoder from {cfg.warm_start} "
+              f"(new {num_classes}-way head is random-init)")
+    else:
+        model = ResNetUNetClassifier(num_classes=num_classes, freeze_encoder=cfg.freeze_encoder).to(device)
+
+    ce_loss = nn.CrossEntropyLoss(weight=rebalance_weights)
+    l1_loss = nn.L1Loss()  # only for logging/comparison; not optimized
+    optimizer = torch.optim.AdamW(_trainable_params(model), lr=cfg.lr)
+
+    start_epoch = 1
+    best_val_ce = math.inf
+    if cfg.resume is not None and cfg.resume.exists():
+        ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_val_ce = ckpt.get("best_val_ce", math.inf)
+        print(f"[train-cls] resumed from {cfg.resume} at epoch {start_epoch}")
+
+    train_loader, val_loader = build_dataloaders(cfg)
+    print(
+        f"[train-cls] train={len(train_loader.dataset)} val={len(val_loader.dataset)} "
+        f"batches/epoch={len(train_loader)} device={device}"
+    )
+
+    decay_start = max(1, cfg.epochs // 2)
+    run_start = time.perf_counter()
+
+    for epoch in range(start_epoch, cfg.epochs + 1):
+        if cfg.unfreeze_after is not None and epoch == cfg.unfreeze_after + 1:
+            model.unfreeze_encoder()
+            optimizer = torch.optim.AdamW(_trainable_params(model), lr=cfg.lr * 0.5)
+            print(f"[train-cls] unfroze encoder at epoch {epoch}; lr={cfg.lr * 0.5}")
+
+        lr_now = cosine_lr(cfg.lr, epoch - 1, cfg.epochs, decay_start)
+        set_lr(optimizer, lr_now)
+
+        model.train()
+        epoch_start = time.perf_counter()
+        running_train_ce = 0.0
+        n_batches = 0
+
+        for step, (l_in, ab_true) in enumerate(train_loader):
+            l_in = l_in.to(device)
+            ab_true = ab_true.to(device)
+
+            # Vectorized nearest-bin lookup per pixel; (N, H, W) class indices.
+            with torch.no_grad():
+                target_cls = ab_to_class(ab_true, bin_centers_lab)
+
+            logits = model(l_in)
+            loss = ce_loss(logits, target_cls)
+
+            if not torch.isfinite(loss):
+                print(
+                    f"[train-cls] WARN non-finite loss at epoch {epoch} step {step}; "
+                    f"skipping update (loss={loss.item()})",
+                    flush=True,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(_trainable_params(model), cfg.grad_clip)
+            optimizer.step()
+
+            running_train_ce += loss.item()
+            n_batches += 1
+
+            if step % 25 == 0:
+                print(
+                    f"[train-cls] epoch {epoch}/{cfg.epochs} step {step}/{len(train_loader)} "
+                    f"ce={loss.item():.4f}",
+                    flush=True,
+                )
+
+        synchronize(device)
+        epoch_time = time.perf_counter() - epoch_start
+        train_ce = running_train_ce / max(1, n_batches)
+
+        # Validation: CE on logits + L1 on annealed-mean ab (for cross-phase comparison).
+        model.eval()
+        val_ce_sum = 0.0
+        val_l1_sum = 0.0
+        n_val = 0
+        with torch.no_grad():
+            for l_in, ab_true in val_loader:
+                l_in = l_in.to(device)
+                ab_true = ab_true.to(device)
+                logits = model(l_in)
+                target_cls = ab_to_class(ab_true, bin_centers_lab)
+                v_ce = ce_loss(logits, target_cls)
+                ab_pred = _annealed_mean_normalized(logits, bin_centers_lab, cfg.temperature)
+                v_l1 = l1_loss(ab_pred, ab_true)
+                val_ce_sum += v_ce.item() * l_in.size(0)
+                val_l1_sum += v_l1.item() * l_in.size(0)
+                n_val += l_in.size(0)
+        val_ce = val_ce_sum / max(1, n_val)
+        val_l1 = val_l1_sum / max(1, n_val)
+
+        is_best = val_ce < best_val_ce
+        if is_best:
+            best_val_ce = val_ce
+
+        state = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_val_ce": best_val_ce,
+            "num_classes": num_classes,
+            "temperature": cfg.temperature,
+            "cfg": {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.__dict__.items()},
+        }
+        torch.save(state, cfg.checkpoint_dir / "last.pth")
+        if is_best:
+            torch.save(state, cfg.checkpoint_dir / "best.pth")
+
+        sample_path: str | None = None
+        if cfg.sample_every > 0 and (epoch % cfg.sample_every == 0 or epoch == cfg.epochs):
+            try:
+                out_dir = PROJECT_ROOT / "outputs" / "samples" / cfg.checkpoint_dir.name
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_png = out_dir / f"epoch_{epoch:03d}.png"
+                ds_val = val_loader.dataset
+                idxs = samples_module.deterministic_indices(len(ds_val), cfg.num_samples, seed=0)
+                grid = _cls_sample_grid(model, ds_val, idxs, device, bin_centers_lab, cfg.temperature)
+                from PIL import Image as _Image
+                _Image.fromarray(grid).save(out_png, format="PNG", optimize=True)
+                sample_path = str(out_png)
+            except Exception as exc:
+                print(f"[train-cls] sample generation failed: {exc}", flush=True)
+
+        payload = {
+            "epoch": epoch,
+            "train_ce": train_ce,
+            "val_ce": val_ce,
+            "val_l1": val_l1,
+            "best_val_ce": best_val_ce,
+            "is_best": is_best,
+            "lr": lr_now,
+            "epoch_time_s": epoch_time,
+            "wall_time_s": time.perf_counter() - run_start,
+            "sample_path": sample_path,
+            "temperature": cfg.temperature,
+            "num_classes": num_classes,
+        }
+        write_log_line(log_path, payload)
+        print(
+            f"[train-cls] epoch {epoch}/{cfg.epochs} done in {epoch_time:.1f}s — "
+            f"train_ce={train_ce:.4f} val_ce={val_ce:.4f} val_l1={val_l1:.4f} "
+            f"best_ce={best_val_ce:.4f}"
+            f"{' [BEST]' if is_best else ''}",
+            flush=True,
+        )
+
+    print(f"[train-cls] finished. Best val_ce={best_val_ce:.4f}. Checkpoints at {cfg.checkpoint_dir}")
+
+
 def main() -> int:
     cfg = parse_args()
     set_seed(cfg.seed)
@@ -599,8 +848,12 @@ def main() -> int:
 
     if cfg.model == "resnet_unet":
         train_resnet_unet(cfg, device)
-    else:
+    elif cfg.model == "cgan":
         train_cgan(cfg, device)
+    elif cfg.model == "resnet_unet_cls":
+        train_resnet_unet_cls(cfg, device)
+    else:
+        raise ValueError(f"Unknown model: {cfg.model}")
     return 0
 
 

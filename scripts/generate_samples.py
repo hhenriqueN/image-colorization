@@ -4,10 +4,19 @@ Loads a checkpoint, picks N deterministic images from a chosen split,
 generates a side-by-side grid `[grayscale L | predicted RGB | ground-truth RGB]`,
 and writes a PNG. Used both as a CLI and imported from scripts/train.py.
 
+Supports both regression checkpoints (ResNetUNet — direct ab output) and
+classification checkpoints (ResNetUNetClassifier — logits converted via
+annealed-mean to ab).
+
 Usage:
     uv run python scripts/generate_samples.py \\
         --checkpoint checkpoints/resnet_unet_run01/best.pth \\
         --output outputs/samples/resnet_unet_run01/epoch_05.png
+
+    uv run python scripts/generate_samples.py \\
+        --checkpoint checkpoints/cls_run01/best.pth \\
+        --output outputs/samples/cls_run01/best.png \\
+        --model-kind classification
 """
 
 from __future__ import annotations
@@ -26,8 +35,10 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.dataset import ColorizationDataset, lab_to_rgb  # noqa: E402
+from src.data.dataset import AB_MAX, DEFAULT_PROCESSED_DIR, ColorizationDataset, lab_to_rgb  # noqa: E402
+from src.data.quantize import annealed_mean  # noqa: E402
 from src.models.resnet_unet import ResNetUNet  # noqa: E402
+from src.models.resnet_unet_cls import ResNetUNetClassifier  # noqa: E402
 
 
 def pick_device(requested: str | None = None) -> torch.device:
@@ -40,14 +51,36 @@ def pick_device(requested: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
-def _load_model(checkpoint_path: Path, device: torch.device) -> ResNetUNet:
+def _load_regression_model(checkpoint_path: Path, device: torch.device) -> ResNetUNet:
     model = ResNetUNet(freeze_encoder=True)
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if isinstance(state, dict) and "model_state_dict" in state:
-        model.load_state_dict(state["model_state_dict"])
-    else:
-        model.load_state_dict(state)
+    if isinstance(state, dict):
+        if "model_state_dict" in state:
+            state = state["model_state_dict"]
+        elif "generator_state_dict" in state:
+            state = state["generator_state_dict"]
+    model.load_state_dict(state)
     return model.to(device).eval()
+
+
+def _load_classification_model(
+    checkpoint_path: Path, device: torch.device
+) -> tuple[ResNetUNetClassifier, int]:
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    num_classes = int(ckpt.get("num_classes")) if "num_classes" in ckpt else None
+    if num_classes is None:
+        # Infer from state dict shape (out_conv.weight shape (in_ch, Q, k, k)).
+        state = ckpt.get("model_state_dict", ckpt)
+        weight = state["out_conv.weight"]
+        num_classes = int(weight.shape[1])
+    model = ResNetUNetClassifier(num_classes=num_classes, freeze_encoder=True)
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state)
+    return model.to(device).eval(), num_classes
+
+
+def _load_bin_centers(path: Path, device: torch.device) -> torch.Tensor:
+    return torch.from_numpy(np.load(path)).to(torch.float32).to(device)
 
 
 def _grayscale_rgb_from_l(l_tensor: torch.Tensor) -> np.ndarray:
@@ -81,13 +114,26 @@ def build_sample_grid(
     dataset: ColorizationDataset,
     indices: list[int],
     device: torch.device,
+    *,
+    bin_centers: torch.Tensor | None = None,
+    temperature: float = 0.38,
 ) -> np.ndarray:
+    """Build a 3-column grid (gray | predicted | truth).
+
+    If `bin_centers` is provided, the model is treated as a classifier and the
+    logits are converted to ab via annealed-mean.
+    """
     model.eval()
+    is_classifier = bin_centers is not None
     rows: list[np.ndarray] = []
     for idx in indices:
         l_tensor, ab_true = dataset[idx]
         l_in = l_tensor.unsqueeze(0).to(device)
-        ab_pred = model(l_in).cpu().squeeze(0).clamp(-1, 1)
+        out = model(l_in)
+        if is_classifier:
+            ab_pred = (annealed_mean(out, bin_centers, temperature) / AB_MAX).cpu().squeeze(0).clamp(-1, 1)
+        else:
+            ab_pred = out.cpu().squeeze(0).clamp(-1, 1)
 
         gray_panel = _grayscale_rgb_from_l(l_tensor)
         pred_panel = lab_to_rgb(l_tensor, ab_pred)
@@ -113,12 +159,26 @@ def generate(
     num_samples: int = 8,
     seed: int = 0,
     device_str: str | None = None,
+    model_kind: str = "regression",
+    bin_centers_path: Path | None = None,
+    temperature: float = 0.38,
 ) -> Path:
     device = pick_device(device_str)
-    model = _load_model(checkpoint, device)
     dataset = ColorizationDataset(split=split, horizontal_flip=False)
     idxs = deterministic_indices(len(dataset), num_samples, seed=seed)
-    grid = build_sample_grid(model, dataset, idxs, device)
+
+    if model_kind == "classification":
+        model, _ = _load_classification_model(checkpoint, device)
+        bin_centers = _load_bin_centers(
+            bin_centers_path or DEFAULT_PROCESSED_DIR / "ab_bin_centers.npy", device
+        )
+        grid = build_sample_grid(
+            model, dataset, idxs, device, bin_centers=bin_centers, temperature=temperature
+        )
+    else:
+        model = _load_regression_model(checkpoint, device)
+        grid = build_sample_grid(model, dataset, idxs, device)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid).save(output_path, format="PNG", optimize=True)
     return output_path
@@ -132,6 +192,11 @@ def main() -> int:
     parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None, help="cpu | mps | cuda")
+    parser.add_argument("--model-kind", default="regression",
+                        choices=["regression", "classification"])
+    parser.add_argument("--bin-centers", type=Path,
+                        default=DEFAULT_PROCESSED_DIR / "ab_bin_centers.npy")
+    parser.add_argument("--temperature", type=float, default=0.38)
     args = parser.parse_args()
 
     out = generate(
@@ -141,6 +206,9 @@ def main() -> int:
         num_samples=args.num_samples,
         seed=args.seed,
         device_str=args.device,
+        model_kind=args.model_kind,
+        bin_centers_path=args.bin_centers,
+        temperature=args.temperature,
     )
     print(f"[samples] wrote {out}")
     return 0
