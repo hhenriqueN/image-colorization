@@ -36,6 +36,9 @@ def lab_to_rgb_tensor(l: torch.Tensor, ab: torch.Tensor) -> torch.Tensor:
     delta = 6.0 / 29.0
 
     def f_inv(t: torch.Tensor) -> torch.Tensor:
+        # Both branches must be finite/safe everywhere because torch.where
+        # propagates gradients through both. t.pow(3) is well-defined
+        # everywhere, and the linear branch is plain arithmetic — fine.
         return torch.where(t > delta, t.pow(3), (t - 16.0 / 116.0) / 7.787)
 
     X = 0.95047 * f_inv(fx)
@@ -49,11 +52,18 @@ def lab_to_rgb_tensor(l: torch.Tensor, ab: torch.Tensor) -> torch.Tensor:
 
     rgb_lin = torch.cat([r, g, b], dim=1).clamp(0.0, 1.0)
 
-    # Linear → gamma-corrected sRGB
+    # Linear → gamma-corrected sRGB.
+    # WARNING: rgb_lin.pow(1.0/2.4) has gradient ~ x**(-0.5833) which is
+    # +inf at x == 0. torch.where computes gradients through BOTH branches,
+    # so 0 * inf = NaN even when the linear branch is selected. We clamp
+    # the pow input above an epsilon to keep the gradient finite — the
+    # mask ensures only values > 0.0031308 actually use this branch in the
+    # forward pass, so the clamp is invisible to the output.
+    safe = rgb_lin.clamp(min=1e-7)
     rgb = torch.where(
         rgb_lin <= 0.0031308,
         12.92 * rgb_lin,
-        1.055 * rgb_lin.pow(1.0 / 2.4) - 0.055,
+        1.055 * safe.pow(1.0 / 2.4) - 0.055,
     )
     return rgb.clamp(0.0, 1.0)
 
