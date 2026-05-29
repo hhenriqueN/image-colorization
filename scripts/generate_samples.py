@@ -1,0 +1,150 @@
+"""Qualitative sample grid generator for a trained colorizer.
+
+Loads a checkpoint, picks N deterministic images from a chosen split,
+generates a side-by-side grid `[grayscale L | predicted RGB | ground-truth RGB]`,
+and writes a PNG. Used both as a CLI and imported from scripts/train.py.
+
+Usage:
+    uv run python scripts/generate_samples.py \\
+        --checkpoint checkpoints/resnet_unet_run01/best.pth \\
+        --output outputs/samples/resnet_unet_run01/epoch_05.png
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import numpy as np
+import torch
+from PIL import Image
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data.dataset import ColorizationDataset, lab_to_rgb  # noqa: E402
+from src.models.resnet_unet import ResNetUNet  # noqa: E402
+
+
+def pick_device(requested: str | None = None) -> torch.device:
+    if requested:
+        return torch.device(requested)
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _load_model(checkpoint_path: Path, device: torch.device) -> ResNetUNet:
+    model = ResNetUNet(freeze_encoder=True)
+    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if isinstance(state, dict) and "model_state_dict" in state:
+        model.load_state_dict(state["model_state_dict"])
+    else:
+        model.load_state_dict(state)
+    return model.to(device).eval()
+
+
+def _grayscale_rgb_from_l(l_tensor: torch.Tensor) -> np.ndarray:
+    """Render the L channel as a 3-channel grayscale image (uint8 H,W,3)."""
+    gray = ((l_tensor.squeeze(0) + 1.0) / 2.0 * 255.0).clamp(0, 255).cpu().numpy()
+    gray_u8 = gray.astype(np.uint8)
+    return np.stack([gray_u8, gray_u8, gray_u8], axis=-1)
+
+
+def _hstack_with_separator(panels: list[np.ndarray], sep: int = 4) -> np.ndarray:
+    h = panels[0].shape[0]
+    separator = np.full((h, sep, 3), 255, dtype=np.uint8)
+    out = panels[0]
+    for p in panels[1:]:
+        out = np.concatenate([out, separator, p], axis=1)
+    return out
+
+
+def _vstack_with_separator(rows: list[np.ndarray], sep: int = 4) -> np.ndarray:
+    w = rows[0].shape[1]
+    separator = np.full((sep, w, 3), 255, dtype=np.uint8)
+    out = rows[0]
+    for r in rows[1:]:
+        out = np.concatenate([out, separator, r], axis=0)
+    return out
+
+
+@torch.no_grad()
+def build_sample_grid(
+    model: ResNetUNet,
+    dataset: ColorizationDataset,
+    indices: list[int],
+    device: torch.device,
+) -> np.ndarray:
+    model.eval()
+    rows: list[np.ndarray] = []
+    for idx in indices:
+        l_tensor, ab_true = dataset[idx]
+        l_in = l_tensor.unsqueeze(0).to(device)
+        ab_pred = model(l_in).cpu().squeeze(0).clamp(-1, 1)
+
+        gray_panel = _grayscale_rgb_from_l(l_tensor)
+        pred_panel = lab_to_rgb(l_tensor, ab_pred)
+        true_panel = lab_to_rgb(l_tensor, ab_true)
+
+        row = _hstack_with_separator([gray_panel, pred_panel, true_panel])
+        rows.append(row)
+
+    return _vstack_with_separator(rows)
+
+
+def deterministic_indices(dataset_size: int, n: int, seed: int = 0) -> list[int]:
+    if dataset_size <= n:
+        return list(range(dataset_size))
+    rng = np.random.default_rng(seed)
+    return sorted(rng.choice(dataset_size, size=n, replace=False).tolist())
+
+
+def generate(
+    checkpoint: Path,
+    output_path: Path,
+    split: str = "val",
+    num_samples: int = 8,
+    seed: int = 0,
+    device_str: str | None = None,
+) -> Path:
+    device = pick_device(device_str)
+    model = _load_model(checkpoint, device)
+    dataset = ColorizationDataset(split=split, horizontal_flip=False)
+    idxs = deterministic_indices(len(dataset), num_samples, seed=seed)
+    grid = build_sample_grid(model, dataset, idxs, device)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(grid).save(output_path, format="PNG", optimize=True)
+    return output_path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate qualitative sample grid")
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--split", default="val", choices=["train", "val", "test"])
+    parser.add_argument("--num-samples", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default=None, help="cpu | mps | cuda")
+    args = parser.parse_args()
+
+    out = generate(
+        checkpoint=args.checkpoint,
+        output_path=args.output,
+        split=args.split,
+        num_samples=args.num_samples,
+        seed=args.seed,
+        device_str=args.device,
+    )
+    print(f"[samples] wrote {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -217,6 +217,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# macOS Finder metadata
+.DS_Store
+
 # Project: data and model artifacts
 data/*
 !data/processed
@@ -225,6 +228,8 @@ data/processed/*
 checkpoints/
 runs/
 wandb/
+outputs/
+logs/
 *.pt
 *.pth
 *.ckpt
