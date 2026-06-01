@@ -15,7 +15,32 @@ Learn a mapping from grayscale input images to plausible colored outputs by trai
 
 ## Project Status
 
-Early stage. Data pipeline is scaffolded; model, training loop, and evaluation are still to be built.
+Three trained colorizers exist after the local-training pivot (the original Kaggle plan
+didn't work end-to-end on Kaggle):
+
+- **Phase A** (`checkpoints/resnet_unet_run03/best.pth`): ResNet-34-encoder + U-Net-decoder,
+  L1 + 0.1·perceptual, 10K subset, 8 epochs. Best `val_l1=0.0834`.
+- **Phase B** (`checkpoints/cgan_run01/best_generator.pth`): same generator warm-started
+  from A, paired with a PatchGAN discriminator. LSGAN + L1 + perceptual, 5K subset, 8
+  epochs. Best `val_l1=0.0800`. D collapsed by epoch 4, so most of the L1 gain came
+  from continued L1/perceptual training rather than from adversarial pressure.
+- **Phase C** (`checkpoints/cls_run01/best.pth`): Zhang-style classification head over
+  214 ab bins, rebalanced cross-entropy, annealed-mean at inference. 25K subset, 10
+  epochs (~6.9 h on M4 MPS). Best `val_l1=0.0775`. **T=0.20 at inference is the
+  saturation breakthrough** — same weights produce visibly more vivid output than
+  Phase A/B (Capitol gets blue sky, apple goes vivid red, boats become cyan).
+
+The main deliverable is `notebooks/04_compare_results.ipynb`, executed in-place with a
+5-column visual grid comparing all three phases against ground truth on held-out val
+images. The full journey log (Kaggle pivot, NaN-on-MPS bug, per-cycle metrics, honest
+assessment of failures) lives in `docs/local_training_log.md`.
+
+## Stack (actual)
+
+- Python 3.12 (pinned via `.python-version`), `uv` for env + dep management
+- PyTorch 2.11 + torchvision, MPS backend on M4 (`PYTORCH_ENABLE_MPS_FALLBACK=1`)
+- scikit-image (RGB↔LAB), Pillow (image I/O), pandas + numpy, matplotlib for plots
+- nbformat + jupyter nbconvert to programmatically build and execute the comparison notebook
 
 ## Data Pipeline
 
@@ -62,30 +87,40 @@ uv run python scripts/preprocess_images.py
 
 In `--manifest` mode the downloader fetches only those specific Open Images IDs, so the resulting splits are identical for every teammate.
 
-## Stack (planned)
-
-- Python
-- PyTorch (or TensorFlow) for model definition and training
-- NumPy / Pillow / OpenCV for image I/O and color-space conversion
-- Jupyter notebooks for exploration and result visualization
-
-## Layout
+## Layout (actual)
 
 ```
 image-colorization/
-├── data/                          # gitignored
-│   ├── raw/                       # FiftyOne-downloaded Open Images
-│   └── processed/                 # 256x256 JPEGs + manifest.csv
-│       ├── train/  val/  test/
-│       └── manifest.csv
+├── data/processed/
+│   ├── train/  val/  test/        # 256×256 JPEGs (gitignored)
+│   ├── manifest.csv               # tracked — bit-exact split reproducibility
+│   ├── ab_bin_centers.npy         # Phase C: 214 ab bin centers (gitignored)
+│   ├── ab_rebalance_weights.npy   # Phase C: class weights (gitignored)
+│   └── bin_priors.png             # Phase C: gamut heatmap (gitignored)
+├── notebooks/
+│   ├── 01_unet.ipynb / 01_unet_kaggle.ipynb              # legacy, dropped
+│   ├── 02_resnet_unet.ipynb / 02_resnet_unet_kaggle.ipynb  # legacy Kaggle source
+│   ├── 03_cgan.ipynb / 03_cgan_kaggle.ipynb              # legacy Kaggle source
+│   └── 04_compare_results.ipynb                          # MAIN deliverable, executed
 ├── scripts/
-│   ├── download_dataset.py        # FiftyOne subset downloader
-│   └── preprocess_images.py       # resize, filter B&W, split
+│   ├── download_dataset.py preprocess_images.py          # data pipeline
+│   ├── make_kaggle_notebooks.py                          # legacy Kaggle adapter
+│   ├── check_mps.py                                      # MPS sanity check
+│   ├── train.py                                          # headless CLI, all 3 model kinds
+│   ├── generate_samples.py compare_checkpoints.py        # visual eval
+│   ├── precompute_classification_priors.py               # Phase C: build ab gamut + weights
+│   └── build_compare_notebook.py                         # rebuild notebook 04
 ├── src/
-│   └── data/
-│       └── dataset.py             # ColorizationDataset (RGB→LAB)
-├── tests/                         # to be added
-├── docs/                          # design notes, experiment logs
-├── pyproject.toml                 # deps + project config (uv-managed)
-└── .python-version                # pinned Python (3.12)
+│   ├── data/dataset.py                                   # ColorizationDataset (RGB→LAB)
+│   ├── data/quantize.py                                  # Phase C: bins + annealed-mean
+│   ├── losses/perceptual.py                              # VGG perceptual loss (NaN-safe MPS)
+│   └── models/
+│       ├── unet.py                                       # legacy Phase 1, unused
+│       ├── resnet_unet.py                                # Phase A/B model
+│       ├── resnet_unet_cls.py                            # Phase C classifier head
+│       └── discriminator.py                              # Phase B PatchGAN
+├── docs/local_training_log.md                            # full journey + metrics
+├── checkpoints/  outputs/                                # gitignored training artifacts
+├── pyproject.toml  .python-version                       # uv-managed, Python 3.12
+└── README.md  CLAUDE.md                                  # public + Claude-facing docs
 ```
