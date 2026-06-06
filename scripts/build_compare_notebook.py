@@ -47,8 +47,9 @@ visual comparisons on validation images.
 under LSGAN + L1 + perceptual.
 **Phase C**: same encoder/decoder warm-started from Phase B, but the final layer outputs
 *Q* per-pixel logits instead of regressing ab. Loss = weighted cross-entropy over precomputed
-ab bins (Zhang et al. 2016). Inference reconstructs ab via temperature-scaled annealed-mean.
-The point of Phase C is to break the sepia attractor that L1-regression suffers from.
+ab bins (Zhang et al. 2016). Inference reconstructs ab via temperature-scaled annealed-mean
+followed by a **bilateral filter** on the ab channels (kills the discrete-bin patchiness
+that low-T inference produces while keeping the saturation gain).
 """))
 
     cells.append(code("""
@@ -69,7 +70,7 @@ if PROJECT_ROOT.name == "notebooks":
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import AB_MAX, ColorizationDataset, lab_to_rgb
-from src.data.quantize import annealed_mean
+from src.data.quantize import annealed_mean, bilateral_smooth_ab
 from src.models.resnet_unet import ResNetUNet
 from src.models.resnet_unet_cls import ResNetUNetClassifier
 
@@ -187,11 +188,19 @@ phase_a_ckpt = PROJECT_ROOT / "checkpoints" / "resnet_unet_run03" / "best.pth"
 phase_b_ckpt = PROJECT_ROOT / "checkpoints" / "cgan_run01"        / "best_generator.pth"
 phase_c_ckpt = PROJECT_ROOT / "checkpoints" / "cls_run01"         / "best.pth"
 
-# Inference temperature for Phase C. The checkpoint was trained reporting
-# val_l1 at Zhang's default T=0.38, but at inference we found T=0.20 gives
-# a much better saturation tradeoff on our 214-bin gamut. T → 0 approaches
-# argmax (vivid but patchy); T → ∞ approaches the mean (sepia again).
-PHASE_C_TEMPERATURE = 0.20
+# Inference recipe for Phase C. The checkpoint was trained reporting
+# val_l1 at Zhang's default T=0.38, but at inference we found:
+#   - T=0.38 → looks almost identical to Phase B (muted, sepia attractor wins)
+#   - T=0.20 → first saturation breakthrough, clean (was our previous default)
+#   - T=0.10 → more vivid still, but starts to show discrete-bin patchiness
+#   - T=0.10 + bilateral filter → vivid AND clean (the current winner)
+# The bilateral filter smooths within similar-color regions while preserving
+# edges, killing the inter-bin jitter without bleeding across real boundaries.
+PHASE_C_TEMPERATURE = 0.10
+PHASE_C_BILATERAL = True
+PHASE_C_BIL_D = 15            # neighborhood diameter (pixels)
+PHASE_C_BIL_SIGMA_COLOR = 25  # LAB-units; ~5 bin-widths
+PHASE_C_BIL_SIGMA_SPACE = 10  # pixels
 
 phase_a = load_regression(phase_a_ckpt)
 phase_b = load_regression(phase_b_ckpt)
@@ -227,6 +236,12 @@ Phase C is the new column — the Zhang-style classification model. Its whole re
 to break the sepia attractor of L1 regression, so look for **stronger saturation, especially
 on inputs Phase A/B handle badly** (bright artificial paint, vivid water, graphic content).
 
+The Phase C column shown here uses **T=0.10 + bilateral filter** on the ab channels — our
+current winning inference recipe (see top of cell above for the parameters). T=0.10 alone
+produces vivid output but with discrete-bin patchiness; the bilateral filter smooths
+within similar-color regions while preserving edges, killing the artifact without losing
+saturation.
+
 Indices are picked deterministically from the full val split (9,222 images) — all out-of-sample.
 If Phase C is unavailable, the column is omitted.
 """))
@@ -249,10 +264,14 @@ def predict_rgb_regression(model, l_tensor):
     return lab_to_rgb(l_tensor, ab_pred)
 
 @torch.no_grad()
-def predict_rgb_classifier(model, l_tensor, bin_centers, T):
+def predict_rgb_classifier(model, l_tensor, bin_centers, T,
+                           bilateral=False, bil_d=15, bil_sc=25, bil_ss=10):
     l_in = l_tensor.unsqueeze(0).to(device)
     logits = model(l_in)
     ab_lab = annealed_mean(logits, bin_centers, temperature=T)
+    if bilateral:
+        ab_lab = bilateral_smooth_ab(ab_lab, diameter=bil_d,
+                                      sigma_color=bil_sc, sigma_space=bil_ss)
     ab_pred = (ab_lab / AB_MAX).cpu().squeeze(0).clamp(-1, 1)
     return lab_to_rgb(l_tensor, ab_pred)
 
@@ -284,7 +303,13 @@ for row, idx in enumerate(indices):
         predict_rgb_regression(phase_b, l_tensor),
     ]
     if has_phase_c:
-        panels.append(predict_rgb_classifier(phase_c, l_tensor, bin_centers, phase_c_T))
+        panels.append(predict_rgb_classifier(
+            phase_c, l_tensor, bin_centers, phase_c_T,
+            bilateral=PHASE_C_BILATERAL,
+            bil_d=PHASE_C_BIL_D,
+            bil_sc=PHASE_C_BIL_SIGMA_COLOR,
+            bil_ss=PHASE_C_BIL_SIGMA_SPACE,
+        ))
     panels.append(lab_to_rgb(l_tensor, ab_true))
 
     for col, panel in enumerate(panels):
@@ -320,9 +345,13 @@ def l1_regression(model, l_tensor, ab_true):
     return F.l1_loss(ab_pred, ab_true).item()
 
 @torch.no_grad()
-def l1_classifier(model, l_tensor, ab_true, bin_centers, T):
+def l1_classifier(model, l_tensor, ab_true, bin_centers, T,
+                  bilateral=False, bil_d=15, bil_sc=25, bil_ss=10):
     l_in = l_tensor.unsqueeze(0).to(device)
     ab_lab = annealed_mean(model(l_in), bin_centers, temperature=T)
+    if bilateral:
+        ab_lab = bilateral_smooth_ab(ab_lab, diameter=bil_d,
+                                      sigma_color=bil_sc, sigma_space=bil_ss)
     ab_pred = (ab_lab / AB_MAX).cpu().squeeze(0).clamp(-1, 1)
     return F.l1_loss(ab_pred, ab_true).item()
 
@@ -333,7 +362,13 @@ for idx in indices:
     lb = l1_regression(phase_b, l_tensor, ab_true)
     row = {"idx": idx, "phase_a_l1": la, "phase_b_l1": lb, "delta_b_minus_a": lb - la}
     if has_phase_c:
-        lc = l1_classifier(phase_c, l_tensor, ab_true, bin_centers, phase_c_T)
+        lc = l1_classifier(
+            phase_c, l_tensor, ab_true, bin_centers, phase_c_T,
+            bilateral=PHASE_C_BILATERAL,
+            bil_d=PHASE_C_BIL_D,
+            bil_sc=PHASE_C_BIL_SIGMA_COLOR,
+            bil_ss=PHASE_C_BIL_SIGMA_SPACE,
+        )
         row["phase_c_l1"] = lc
         row["delta_c_minus_a"] = lc - la
         row["delta_c_minus_b"] = lc - lb

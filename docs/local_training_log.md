@@ -380,11 +380,51 @@ adversarial training in Phase B.
 - **The MPS NaN fix from Phase A** carried over — no new numerical issues
   in cross-entropy training.
 
+## Update — Bilateral post-processing (2026-06-06)
+
+Implemented step 1 of the "next steps" list: bilateral filter on the
+annealed-mean ab output. This is the standard fix for discrete-bin
+patchiness at low temperatures.
+
+`src/data/quantize.py::bilateral_smooth_ab` runs `cv2.bilateralFilter`
+on each ab channel of each image independently (no joint-bilateral
+because `cv2.ximgproc.jointBilateralFilter` isn't in the wheel we have;
+vanilla bilateral on ab was enough). Wired through `generate_samples.py`
+as `--bilateral` and into the notebook's predict path.
+
+**Parameter sweep at T=0.10:**
+| diameter | sigma_color | sigma_space | result |
+|---|---|---|---|
+| 9 | 15 | 9 | mild smoothing — patchiness still visible on apple, zebra chair |
+| **15** | **25** | **10** | **clean — chosen recipe** |
+| 21 | 40 | 12 | nearly identical to d=15; diminishing returns |
+
+Also tested **T=0.05 + bilateral d=15** — even more vivid, still clean,
+but starting to over-saturate naturally-muted scenes (sky becomes too
+purple, foliage too yellow). Kept T=0.10 as the safer default.
+
+**Winning recipe**: `annealed_mean(T=0.10)` → `bilateral_smooth_ab(d=15,
+sigma_color=25, sigma_space=10)`. This is what
+`notebooks/04_compare_results.ipynb` now displays in the Phase C column.
+
+Compared to T=0.20 (the previous notebook default), the new recipe:
+- preserves the cyan boats, vivid red apple, blue Capitol sky etc. that
+  T=0.20 already produced
+- pushes saturation noticeably further on the zebra-print chair (yellow
+  + red separation is more confident), the rollercoaster clothing, and
+  rare-color regions in general
+- has no visible patchiness — the bilateral kills the bin-jump artifacts
+  cleanly without bleeding across edges
+
+The improvement is real but incremental — Phase C with bilateral is
+better than Phase C without, but the much bigger jumps in the project
+were Phase A → A2 (more data) and the temperature finding itself
+(T=0.38 → T=0.20).
+
 ## Next steps if we keep iterating
 
-In order:
-1. **Bilateral filter post-processing** on the annealed-mean output to kill
-   the patchiness at low T. Cheapest visible quality bump.
+In order (1 done, 2-4 remaining):
+1. ~~Bilateral filter post-processing~~ ✅ done 2026-06-06.
 2. **Finer bin grid (step 4, ~350 bins)** for smoother color gradations.
 3. **Drop the warm-start** and train Phase C from a Phase-A-warm start
    instead — the cGAN's bias may be pulling the classification head toward
@@ -392,6 +432,11 @@ In order:
 4. **Train on the full 75 K images** for ≥ 20 epochs. Phase C with a
    bigger dataset should generalize better to the rare-color tail that
    rebalancing tries to upweight.
+5. *(new)* **Joint bilateral filter** with the L channel as guide. Our
+   vanilla bilateral works without L guidance because the ab channels
+   already encode chrominance edges, but JBF would preserve subtler
+   luminance-only edges (specular highlights, shadow boundaries). Would
+   need `opencv-contrib-python` or a PyTorch implementation.
 
 ---
 
@@ -410,7 +455,10 @@ In order:
 - Per-epoch training sample grids: `outputs/samples/{run_name}/epoch_NNN.png`
 - Phase C temperature comparisons:
   `outputs/samples/cls_run01/best_T038.png` (default, muted)
-  `outputs/samples/cls_run01/best_T020.png` (sweet spot, vivid + clean)
-  `outputs/samples/cls_run01/best_T010.png` (most vivid, some patchiness)
+  `outputs/samples/cls_run01/best_T020.png` (previous notebook recipe)
+  `outputs/samples/cls_run01/best_T010.png` (vivid, patchy without filter)
+  `outputs/samples/cls_run01/T010_bil_d15_sc25_ss10.png` (current winner: vivid + smooth)
+  `outputs/samples/cls_run01/T005_bil_d15_sc30_ss12.png` (over-saturates muted scenes)
+  `outputs/samples/cls_run01/T005_nobil.png` (max patchiness reference)
 - Per-run metrics: `checkpoints/{run_name}/log.jsonl` (one JSON object per
   epoch)

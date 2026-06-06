@@ -16,6 +16,7 @@ Conventions
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -158,3 +159,52 @@ def annealed_mean(
     bin_centers = bin_centers.to(logits.device, logits.dtype)
     # einsum: probs (n, q, h, w) × centers (q, c) → (n, c, h, w)
     return torch.einsum("nqhw,qc->nchw", probs, bin_centers)
+
+
+def bilateral_smooth_ab(
+    ab_lab: torch.Tensor,
+    diameter: int = 9,
+    sigma_color: float = 15.0,
+    sigma_space: float = 9.0,
+) -> torch.Tensor:
+    """Bilateral post-processing on classification-derived ab channels.
+
+    At low annealed-mean temperatures Phase C produces vivid but spatially
+    "patchy" output because adjacent pixels jump between discrete bins. A
+    bilateral filter smooths within similar-color regions while preserving
+    edges, which is exactly the right tool for this discrete-bin artifact.
+
+    Runs on CPU via OpenCV. For our batch sizes (8-16) and image size
+    (256×256) this is fast (<100 ms per image). The filter is applied per
+    channel and per image; we do NOT use the L channel as a guide because
+    cv2.bilateralFilter is single-image. For a joint-bilateral variant
+    that uses L as the guide we'd need opencv-contrib's ximgproc, which
+    isn't bundled with the cv2 wheel we have.
+
+    Parameters
+    ----------
+    ab_lab      : Tensor (N, 2, H, W) in LAB units (any device).
+    diameter    : Pixel neighborhood diameter. 9 covers ~4 pixel radius.
+    sigma_color : Filter sigma in LAB color space. Bin width is 5, so 15
+                  averages roughly across 3 adjacent bins — enough to kill
+                  inter-bin jitter without bleeding into different colors.
+    sigma_space : Spatial sigma in pixels. Smaller = tighter smoothing.
+
+    Returns
+    -------
+    ab_lab_smoothed : Tensor (N, 2, H, W) on the same device/dtype as input.
+    """
+    import cv2  # local import: optional dep; only required for this path
+
+    if ab_lab.dim() != 4 or ab_lab.shape[1] != 2:
+        raise ValueError(f"ab_lab must be (N, 2, H, W); got {tuple(ab_lab.shape)}")
+    device, dtype = ab_lab.device, ab_lab.dtype
+    ab_np = ab_lab.detach().cpu().to(torch.float32).numpy()  # (N, 2, H, W)
+
+    smoothed = np.empty_like(ab_np)
+    for n in range(ab_np.shape[0]):
+        for c in range(2):
+            smoothed[n, c] = cv2.bilateralFilter(
+                ab_np[n, c], diameter, sigma_color, sigma_space
+            )
+    return torch.from_numpy(smoothed).to(device=device, dtype=dtype)

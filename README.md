@@ -2,7 +2,7 @@
 
 Deep learning project: train a neural network to colorize black and white images. Predict the `a`, `b` chrominance channels (LAB color space) from the `L` luminance channel using a convolutional encoder–decoder, working at 256×256 resolution.
 
-**Current best model:** Phase C — Zhang-style classification colorizer over 214 ab bins, warm-started from Phase B's cGAN generator. Final `val_l1 = 0.0775` on the annealed-mean output. At inference temperature **T=0.20** it produces visibly more saturated results than any of the regression-loss phases — see [`notebooks/04_compare_results.ipynb`](./notebooks/04_compare_results.ipynb).
+**Current best model:** Phase C — Zhang-style classification colorizer over 214 ab bins, warm-started from Phase B's cGAN generator. Final `val_l1 = 0.0775` on the annealed-mean output. At inference temperature **T=0.10 + bilateral filter** on the ab channels (`src/data/quantize.py::bilateral_smooth_ab`) it produces visibly more saturated results than any of the regression-loss phases without the discrete-bin patchiness you get from low T alone — see [`notebooks/04_compare_results.ipynb`](./notebooks/04_compare_results.ipynb).
 
 For a deeper overview (color space, model family) see [`CLAUDE.md`](./CLAUDE.md). For the full trajectory of what we tried, why, the bugs we hit, and what still doesn't work, see [`docs/local_training_log.md`](./docs/local_training_log.md).
 

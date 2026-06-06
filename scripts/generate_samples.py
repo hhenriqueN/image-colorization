@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import AB_MAX, DEFAULT_PROCESSED_DIR, ColorizationDataset, lab_to_rgb  # noqa: E402
-from src.data.quantize import annealed_mean  # noqa: E402
+from src.data.quantize import annealed_mean, bilateral_smooth_ab  # noqa: E402
 from src.models.resnet_unet import ResNetUNet  # noqa: E402
 from src.models.resnet_unet_cls import ResNetUNetClassifier  # noqa: E402
 
@@ -117,11 +117,17 @@ def build_sample_grid(
     *,
     bin_centers: torch.Tensor | None = None,
     temperature: float = 0.38,
+    bilateral: bool = False,
+    bilateral_d: int = 9,
+    bilateral_sigma_color: float = 15.0,
+    bilateral_sigma_space: float = 9.0,
 ) -> np.ndarray:
     """Build a 3-column grid (gray | predicted | truth).
 
     If `bin_centers` is provided, the model is treated as a classifier and the
-    logits are converted to ab via annealed-mean.
+    logits are converted to ab via annealed-mean. `bilateral=True` additionally
+    smooths the per-image ab output with `bilateral_smooth_ab` — useful when
+    using low temperature (T ≲ 0.15) where discrete-bin patchiness shows up.
     """
     model.eval()
     is_classifier = bin_centers is not None
@@ -131,7 +137,15 @@ def build_sample_grid(
         l_in = l_tensor.unsqueeze(0).to(device)
         out = model(l_in)
         if is_classifier:
-            ab_pred = (annealed_mean(out, bin_centers, temperature) / AB_MAX).cpu().squeeze(0).clamp(-1, 1)
+            ab_lab = annealed_mean(out, bin_centers, temperature)  # (1, 2, H, W) in LAB units
+            if bilateral:
+                ab_lab = bilateral_smooth_ab(
+                    ab_lab,
+                    diameter=bilateral_d,
+                    sigma_color=bilateral_sigma_color,
+                    sigma_space=bilateral_sigma_space,
+                )
+            ab_pred = (ab_lab / AB_MAX).cpu().squeeze(0).clamp(-1, 1)
         else:
             ab_pred = out.cpu().squeeze(0).clamp(-1, 1)
 
@@ -162,6 +176,10 @@ def generate(
     model_kind: str = "regression",
     bin_centers_path: Path | None = None,
     temperature: float = 0.38,
+    bilateral: bool = False,
+    bilateral_d: int = 9,
+    bilateral_sigma_color: float = 15.0,
+    bilateral_sigma_space: float = 9.0,
 ) -> Path:
     device = pick_device(device_str)
     dataset = ColorizationDataset(split=split, horizontal_flip=False)
@@ -173,7 +191,13 @@ def generate(
             bin_centers_path or DEFAULT_PROCESSED_DIR / "ab_bin_centers.npy", device
         )
         grid = build_sample_grid(
-            model, dataset, idxs, device, bin_centers=bin_centers, temperature=temperature
+            model, dataset, idxs, device,
+            bin_centers=bin_centers,
+            temperature=temperature,
+            bilateral=bilateral,
+            bilateral_d=bilateral_d,
+            bilateral_sigma_color=bilateral_sigma_color,
+            bilateral_sigma_space=bilateral_sigma_space,
         )
     else:
         model = _load_regression_model(checkpoint, device)
@@ -197,6 +221,11 @@ def main() -> int:
     parser.add_argument("--bin-centers", type=Path,
                         default=DEFAULT_PROCESSED_DIR / "ab_bin_centers.npy")
     parser.add_argument("--temperature", type=float, default=0.38)
+    parser.add_argument("--bilateral", action="store_true",
+                        help="Apply cv2.bilateralFilter on ab channels after annealed-mean.")
+    parser.add_argument("--bilateral-d", type=int, default=9)
+    parser.add_argument("--bilateral-sigma-color", type=float, default=15.0)
+    parser.add_argument("--bilateral-sigma-space", type=float, default=9.0)
     args = parser.parse_args()
 
     out = generate(
@@ -209,6 +238,10 @@ def main() -> int:
         model_kind=args.model_kind,
         bin_centers_path=args.bin_centers,
         temperature=args.temperature,
+        bilateral=args.bilateral,
+        bilateral_d=args.bilateral_d,
+        bilateral_sigma_color=args.bilateral_sigma_color,
+        bilateral_sigma_space=args.bilateral_sigma_space,
     )
     print(f"[samples] wrote {out}")
     return 0
