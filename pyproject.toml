@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.27",
     "torch>=2.0",
     "torchvision>=0.15",
+    "segmentation-models-pytorch>=0.3.4",
     "pillow>=10.0",
     "numpy>=1.24",
     "scikit-image>=0.21",
