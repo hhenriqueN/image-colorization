@@ -55,6 +55,18 @@ class SmpUNetClassifier(nn.Module):
             p.requires_grad_(True)
         self._encoder_frozen = False
 
+    def unfreeze_last_block(self) -> None:
+        """Unfreeze only the final ResNet block (`encoder.layer4`).
+
+        Lighter alternative to a full encoder unfreeze: lets the dense-prediction
+        gradients gently adapt the highest-level semantic features without
+        perturbing the lower-level (more general) representations. Pairs with a
+        low LR (~1e-5) and a short tail of 2–3 epochs.
+        """
+        for p in self.unet.encoder.layer4.parameters():
+            p.requires_grad_(True)
+        self._encoder_frozen = False  # at least partially trainable now
+
     def train(self, mode: bool = True) -> "SmpUNetClassifier":
         super().train(mode)
         if self._encoder_frozen:
@@ -80,11 +92,14 @@ class SmpUNetClassifier(nn.Module):
         freeze_encoder: bool = True,
         map_location: str | torch.device = "cpu",
     ) -> "SmpUNetClassifier":
-        """Warm-start by loading an SmpUNet regression checkpoint.
+        """Warm-start from either a regression *or* classification SmpUNet checkpoint.
 
-        Filters out the segmentation head (`unet.segmentation_head.*`) and
-        loads everything else. The new num_classes-way head stays random-init.
-        Raises if the checkpoint contains keys outside the expected prefixes.
+        Auto-detects head-shape compatibility:
+          • Regression checkpoint (head_out=2) → head dropped, kept random-init.
+          • Classification checkpoint with matching `num_classes` → head transferred too.
+          • Classification checkpoint with mismatched Q → head dropped (logged).
+
+        Encoder + decoder weights always transfer.
         """
         model = cls(num_classes=num_classes, freeze_encoder=freeze_encoder)
         state = torch.load(ckpt_path, map_location=map_location, weights_only=False)
@@ -95,7 +110,18 @@ class SmpUNetClassifier(nn.Module):
                 state = state["generator_state_dict"]
 
         head_prefix = "unet.segmentation_head."
-        filtered = {k: v for k, v in state.items() if not k.startswith(head_prefix)}
+        model_state = model.state_dict()
+        head_compatible = True
+        for k in (k for k in state if k.startswith(head_prefix)):
+            if k in model_state and tuple(state[k].shape) != tuple(model_state[k].shape):
+                head_compatible = False
+                break
+
+        if head_compatible:
+            filtered = state
+        else:
+            filtered = {k: v for k, v in state.items() if not k.startswith(head_prefix)}
+
         missing, unexpected = model.load_state_dict(filtered, strict=False)
 
         unexpected_real = [k for k in unexpected if not k.startswith(head_prefix)]

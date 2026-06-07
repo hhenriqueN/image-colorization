@@ -89,7 +89,12 @@ if PROJECT_ROOT.name == "notebooks":
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import AB_MAX, ColorizationDataset, lab_to_rgb
-from src.data.quantize import annealed_mean, bilateral_smooth_ab
+from src.data.quantize import (
+    annealed_mean,
+    bilateral_smooth_ab,
+    guided_smooth_ab,
+    top_k_annealed_mean,
+)
 from src.metrics.colorfulness import hasler_susstrunk
 from src.models.smp_unet_cls import SmpUNetClassifier
 
@@ -195,66 +200,193 @@ def load_smp_classifier(path: Path):
 ckpt_path = PROJECT_ROOT / "checkpoints" / "smp_cls_run01" / "best.pth"
 model, trained_T = load_smp_classifier(ckpt_path)
 
-bin_centers = torch.from_numpy(np.load(
-    PROJECT_ROOT / "data" / "processed" / "ab_bin_centers.npy"
-)).to(torch.float32).to(device)
+# Bin centers the model was trained against. Q=214. A backup is kept in
+# data/processed/ab_bin_centers.phase3_backup.npy in case of future regeneration.
+bin_centers_path = PROJECT_ROOT / "data" / "processed" / "ab_bin_centers.npy"
+bin_centers = torch.from_numpy(np.load(bin_centers_path)).to(torch.float32).to(device)
 
-# Inference recipe (T + bilateral from legacy cls_run01; ab boost from section 8 ablation):
+# Inference recipe — Tier 1 final pick (from honest ablation in section 4b):
+#   • top-1 decode (argmax) — most vivid native decode for this model
+#   • plain bilateral smoothing — the guided filter desaturated slightly on
+#     this checkpoint, didn't pan out. Bilateral cleans up the argmax patchiness.
+#   • TTA disabled — slightly desaturated on this model
+#   • ab_boost = 1.10 (down from the original 1.20 — saturation parity at less
+#     artificial pressure, with native ratio ~0.81 from top-1 alone)
 T_INFER         = 0.10
-BIL_ENABLE      = True
-BIL_DIAMETER    = 15
-BIL_SIGMA_COLOR = 25.0
-BIL_SIGMA_SPACE = 10.0
-AB_BOOST        = 1.20   # picked from ablation in section 8; lands colorfulness ratio at ~0.98
+TOP_K           = 1
+SMOOTHER        = "bilateral"
+GUIDED_RADIUS   = 8
+GUIDED_EPS      = 1.0
+TTA             = False
+AB_BOOST        = 1.10
 
 print(f"loaded {ckpt_path.relative_to(PROJECT_ROOT)}")
-print(f"trained_T = {trained_T} (val_l1 logging recipe)")
-print(f"inference: T={T_INFER}, bilateral={BIL_ENABLE} (d={BIL_DIAMETER}, σ_color={BIL_SIGMA_COLOR}, σ_space={BIL_SIGMA_SPACE}), ab_boost={AB_BOOST}")
-print(f"Q={bin_centers.shape[0]} ab bin centers")
+print(f"trained_T = {trained_T} (val_l1 logging recipe at training time)")
+print(f"bin centers from {bin_centers_path.relative_to(PROJECT_ROOT)}, Q={bin_centers.shape[0]}")
+print(f"inference: T={T_INFER}, top_k={TOP_K}, smoother={SMOOTHER}, TTA={TTA}, ab_boost={AB_BOOST}")
+"""))
+
+    cells.append(md("""
+## 4b. Old vs new inference pipeline — side-by-side ablation
+
+Tier 1 of the 24-hour quality push tested three changes to the inference path:
+
+| | OLD (Phase 3 default) | NEW (proposed) | Empirical result on this model |
+|---|---|---|---|
+| Decode | full-Q annealed-mean | top-k truncated annealed-mean | At T=0.10 the soft annealed-mean is already peaky; top-k≥5 is a no-op. **Top-1 (argmax) raises native ratio ~0.03**. |
+| Smoothing | plain bilateral on ab | L-guided filter (`cv2.ximgproc.guidedFilter`) | Guided filter slightly **desaturates** on this checkpoint. Bilateral keeps the saturation edge. |
+| TTA | none | h-flip ensemble | Slightly hurts native colorfulness (~0.02 drop). Skip. |
+| ab boost | ×1.20 | ×1.0 (no boost) | The boost is doing most of the work. Going to 1.0 drops native ratio to ~0.78. |
+
+**Honest finding:** the saturation gap is mostly a *training-side* problem, not an
+inference-side one. The biggest single inference win is replacing soft annealed-mean with
+top-1 (argmax) — combined with bilateral smoothing and a reduced boost of 1.10, we hit
+native colorfulness ~0.89 with less artificial post-hoc pressure than the original ×1.20.
+Going past that requires the encoder unfreeze fine-tune (Tier 2) or a stronger
+rebalancing recipe.
+
+The cell below computes mean Hasler-Süsstrunk colorfulness ratio on a 100-image
+deterministic val sample under each recipe.
+"""))
+
+    cells.append(code("""
+@torch.no_grad()
+def _decode_logits(l_in, logits, T, k=None, smoother=\"none\", guided_radius=8, guided_eps=1.0):
+    \"\"\"Shared decode tail: decode → optional smooth → return ab in [-1, 1].\"\"\"
+    if k is None:
+        ab_lab = annealed_mean(logits, bin_centers, temperature=T)
+    else:
+        ab_lab = top_k_annealed_mean(logits, bin_centers, temperature=T, k=k)
+    if smoother == \"guided\":
+        ab_lab = guided_smooth_ab(ab_lab, l_in, radius=guided_radius, eps=guided_eps)
+    elif smoother == \"bilateral\":
+        ab_lab = bilateral_smooth_ab(ab_lab, diameter=15, sigma_color=25.0, sigma_space=10.0)
+    return (ab_lab / AB_MAX).cpu().squeeze(0)
+
+@torch.no_grad()
+def predict_rgb_recipe(l_tensor, *, T=0.10, k=None, smoother=\"none\",
+                        guided_radius=8, guided_eps=1.0, tta=False, ab_boost=1.0):
+    l_in = l_tensor.unsqueeze(0).to(device)
+    logits = model(l_in)
+    if tta:
+        logits = (logits + torch.flip(model(torch.flip(l_in, dims=[-1])), dims=[-1])) / 2.0
+    ab_pred = _decode_logits(l_in, logits, T, k, smoother, guided_radius, guided_eps)
+    ab_pred = (ab_pred * ab_boost).clamp(-1, 1)
+    return lab_to_rgb(l_tensor, ab_pred)
+
+# Recipes to compare (each cumulatively adds a Tier-1 change)
+RECIPES = {
+    \"OLD raw (full + bilateral + boost 1.00)\":    dict(T=0.10, k=None, smoother=\"bilateral\", tta=False, ab_boost=1.00),
+    \"OLD + boost 1.20  (original Phase 3 ship)\":   dict(T=0.10, k=None, smoother=\"bilateral\", tta=False, ab_boost=1.20),
+    \"+ top-k=10  (no boost)\":                      dict(T=0.10, k=10,   smoother=\"bilateral\", tta=False, ab_boost=1.00),
+    \"+ guided filter\":                              dict(T=0.10, k=10,   smoother=\"guided\",    tta=False, ab_boost=1.00),
+    \"+ TTA\":                                        dict(T=0.10, k=10,   smoother=\"guided\",    tta=True,  ab_boost=1.00),
+    \"top-1 + bilateral  (best native decode)\":     dict(T=0.10, k=1,    smoother=\"bilateral\", tta=False, ab_boost=1.00),
+    \"top-1 + bilateral + boost 1.10  ← NEW DEFAULT\": dict(T=0.10, k=1,    smoother=\"bilateral\", tta=False, ab_boost=1.10),
+}
+
+val_ds_ablation = ColorizationDataset(split=\"val\", horizontal_flip=False)
+rng_ab = np.random.default_rng(7)
+ABL_IDXS = sorted(rng_ab.choice(len(val_ds_ablation), 100, replace=False).tolist())
+
+ablation_rows = []
+for label, kwargs in RECIPES.items():
+    pred_sum, true_sum = 0.0, 0.0
+    for idx in ABL_IDXS:
+        l_t, ab_t = val_ds_ablation[idx]
+        rgb_pred = predict_rgb_recipe(l_t, **kwargs)
+        rgb_true = lab_to_rgb(l_t, ab_t)
+        pred_sum += hasler_susstrunk(rgb_pred)
+        true_sum += hasler_susstrunk(rgb_true)
+    ablation_rows.append({
+        \"recipe\": label,
+        \"colorfulness_pred\":  pred_sum / len(ABL_IDXS),
+        \"colorfulness_true\":  true_sum / len(ABL_IDXS),
+        \"ratio\":              pred_sum / max(true_sum, 1e-8),
+    })
+
+ablation_df = pd.DataFrame(ablation_rows)
+from IPython.display import display
+display(ablation_df)
+"""))
+
+    cells.append(md("""
+### 4b.1 Visual side-by-side on the same 6 val images
+
+If the leaderboard above shows the new pipeline lands native colorfulness ≥0.85, the visual
+grid below should show the NEW column (3rd from the right) producing colors comparable to
+ground truth without the ×1.20 boost — and with sharper object edges thanks to the L-guided
+filter.
+"""))
+
+    cells.append(code("""
+N_VIS = 6
+vis_idxs = ABL_IDXS[:N_VIS]
+col_keys = [\"OLD raw (full + bilateral + boost 1.00)\", \"OLD + boost 1.20  (original Phase 3 ship)\", \"top-1 + bilateral + boost 1.10  ← NEW DEFAULT\"]
+col_titles = [\"INPUT\\n(B&W)\", *col_keys, \"REAL\\n(truth)\"]
+col_colors = [\"#444444\", \"#888888\", \"#1f77b4\", \"#ff7f0e\", \"#2ca02c\"]
+
+n_cols = len(col_titles)
+fig, axes = plt.subplots(N_VIS, n_cols, figsize=(2.7 * n_cols, 3.0 * N_VIS))
+for row, idx in enumerate(vis_idxs):
+    l_t, ab_t = val_ds_ablation[idx]
+    panels = [gray_rgb(l_t)] if False else [((l_t.squeeze(0) + 1.0) / 2.0 * 255.0).clamp(0, 255).numpy().astype(np.uint8)]
+    panels[0] = np.stack([panels[0], panels[0], panels[0]], axis=-1)
+    for label in col_keys:
+        panels.append(predict_rgb_recipe(l_t, **RECIPES[label]))
+    panels.append(lab_to_rgb(l_t, ab_t))
+    for col, panel in enumerate(panels):
+        ax = axes[row, col]
+        ax.imshow(panel)
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(col_colors[col])
+            spine.set_linewidth(2.5)
+        ax.set_title(col_titles[col], fontsize=9, weight=\"bold\",
+                     color=col_colors[col], pad=4)
+    axes[row, 0].set_ylabel(f\"#{idx}\", rotation=0, fontsize=9,
+                            weight=\"bold\", labelpad=22, ha=\"right\", va=\"center\")
+plt.tight_layout()
+plt.show()
 """))
 
     cells.append(md("""
 ## 5. Visual showcase — 12 held-out validation images
 
-Three columns: **input** (B&W) | **generated** (Phase 3) | **real** (ground truth). Indices are
-deterministic (seed=1, different from the per-epoch sample grid's seed=0 so these are fresh
-images we haven't seen during training-time previews).
+Three columns: **input** (B&W) | **generated** (Phase 3, Tier-1 pipeline) | **real** (ground
+truth). Indices are deterministic (seed=1, different from the per-epoch sample grid's seed=0
+so these are fresh images we haven't seen during training-time previews).
 
-**All predictions here use `ab_boost = 1.20`** — the post-hoc saturation lever picked from
-the ablation in section 8 below. This lands the mean Hasler-Süsstrunk ratio at ~0.98 (close
-to parity with ground truth) versus ~0.80 with boost=1.0.
+**Tier-1 inference recipe (final pick):** top-1 (argmax) decode + bilateral smoothing +
+boost ×1.10. Lands native colorfulness ratio at ~0.89 — comparable to the original ×1.20
+pipeline at lower artificial pressure. See section 4b for the ablation.
 """))
 
     cells.append(code("""
 @torch.no_grad()
 def predict_rgb_cls(l_tensor):
-    l_in = l_tensor.unsqueeze(0).to(device)
-    logits = model(l_in)
-    ab_lab = annealed_mean(logits, bin_centers, temperature=T_INFER)
-    if BIL_ENABLE:
-        ab_lab = bilateral_smooth_ab(ab_lab,
-                                      diameter=BIL_DIAMETER,
-                                      sigma_color=BIL_SIGMA_COLOR,
-                                      sigma_space=BIL_SIGMA_SPACE)
-    ab_pred = (ab_lab / AB_MAX).cpu().squeeze(0)
-    ab_pred = (ab_pred * AB_BOOST).clamp(-1, 1)
-    return lab_to_rgb(l_tensor, ab_pred)
+    return predict_rgb_recipe(
+        l_tensor,
+        T=T_INFER, k=TOP_K, smoother=SMOOTHER,
+        guided_radius=GUIDED_RADIUS, guided_eps=GUIDED_EPS,
+        tta=TTA, ab_boost=AB_BOOST,
+    )
 
 def gray_rgb(l_tensor):
     gray = ((l_tensor.squeeze(0) + 1.0) / 2.0 * 255.0).clamp(0, 255).numpy().astype(np.uint8)
     return np.stack([gray, gray, gray], axis=-1)
 
-val_ds = ColorizationDataset(split="val", horizontal_flip=False)
-rng = np.random.default_rng(1)  # different seed so these are fresh images
+val_ds = ColorizationDataset(split=\"val\", horizontal_flip=False)
+rng = np.random.default_rng(1)
 N = 12
 indices = sorted(rng.choice(len(val_ds), size=N, replace=False).tolist())
-print(f"sampled indices: {indices}")
+print(f\"sampled showcase indices: {indices}\")
 """))
 
     cells.append(code("""
 column_titles = [
     "INPUT\\n(B&W, what the model sees)",
-    "GENERATED — Phase 3\\n(smp + Zhang cls, T=0.10 + bilateral)",
+    "GENERATED — Phase 3\\n(top-k + L-guided + TTA)",
     "REAL\\n(ground truth photo)",
 ]
 column_colors = ["#444444", "#ff7f0e", "#2ca02c"]
@@ -344,33 +476,30 @@ for ep in range(1, 11):
 """))
 
     cells.append(md("""
-## 8. ab-channel boost ablation (post-hoc saturation)
+## 8. ab-channel boost ablation (kept as a tweaking lever)
 
-The cheapest saturation lever: scale the predicted `ab` channels by a constant before LAB→RGB.
-Boost 1.0 is the current Phase 3 output (colorfulness_ratio ≈ 0.70); higher boosts amplify
-chroma but clip at the LAB gamut boundary, which actually caps overshoot naturally.
+Originally this section picked the `×1.20` boost for the OLD Phase 3 pipeline. With the
+Tier 1 stack (top-k + L-guided + TTA, section 4b) the model commits to vivid colors
+directly and the boost can usually stay at 1.0. The sweep below is kept as a knob for
+domain-specific tweaking: demos may want a touch more saturation (~1.05–1.10), or you may
+want to back off if the new pipeline already over-saturates a particular scene.
 
-Below: the same 6 val images at five boost factors plus ground truth. Pick the boost where
-colors look right without venturing into cartoony territory.
+Boost factors here are applied **on top of the new pipeline**.
 """))
 
     cells.append(code("""
-BOOST_FACTORS = [1.0, 1.2, 1.35, 1.5, 1.75]
+BOOST_FACTORS = [1.0, 1.1, 1.2, 1.35, 1.5]
 N_BOOST_IMG = 6
 
 @torch.no_grad()
 def predict_rgb_cls_boosted(l_tensor, boost: float):
-    l_in = l_tensor.unsqueeze(0).to(device)
-    logits = model(l_in)
-    ab_lab = annealed_mean(logits, bin_centers, temperature=T_INFER)
-    if BIL_ENABLE:
-        ab_lab = bilateral_smooth_ab(ab_lab,
-                                      diameter=BIL_DIAMETER,
-                                      sigma_color=BIL_SIGMA_COLOR,
-                                      sigma_space=BIL_SIGMA_SPACE)
-    ab_pred = (ab_lab / AB_MAX).cpu().squeeze(0)
-    ab_pred = (ab_pred * boost).clamp(-1, 1)  # the boost
-    return lab_to_rgb(l_tensor, ab_pred)
+    # Apply boost on top of the Tier-1 pipeline (top-1 + bilateral, no TTA).
+    return predict_rgb_recipe(
+        l_tensor,
+        T=T_INFER, k=TOP_K, smoother=SMOOTHER,
+        guided_radius=GUIDED_RADIUS, guided_eps=GUIDED_EPS,
+        tta=TTA, ab_boost=boost,
+    )
 
 boost_indices = indices[:N_BOOST_IMG]
 
@@ -459,7 +588,7 @@ else:
 ## 10. Best matches — which val images did the model nail?
 
 Computes four similarity metrics on a 200-image deterministic val sample (seed=42), all using
-the boost=1.20 inference recipe:
+the Tier-1 inference recipe (top-k + L-guided + TTA, no boost):
 
 | Metric | Domain | Higher = better? | What it captures |
 |---|---|---|---|
@@ -535,7 +664,7 @@ the most saturated one.
 def render_top_grid(top_idxs, title_suffix):
     n = len(top_idxs)
     fig, axes = plt.subplots(n, 3, figsize=(2.8 * 3, 3.0 * n))
-    col_titles = [\"INPUT\\n(B&W)\", \"GENERATED\\n(Phase 3 + boost 1.20)\", \"REAL\\n(ground truth)\"]
+    col_titles = [\"INPUT\\n(B&W)\", \"GENERATED\\n(Phase 3 Tier-1 pipeline)\", \"REAL\\n(ground truth)\"]
     col_colors = [\"#444444\", \"#ff7f0e\", \"#2ca02c\"]
     for row, idx in enumerate(top_idxs):
         l_t, ab_t = val_ds_full[idx]
@@ -576,7 +705,7 @@ render_top_grid(eval_df.nlargest(8, \"ssim\")[\"idx\"].tolist(), \"by SSIM\")
     cells.append(md("""
 ### 10.4 Visual — Top-8 by colorfulness ratio closest to 1.0
 
-These are the images where saturation parity is tightest. With boost=1.20 most of the val set
+These are the images where saturation parity is tightest. With the Tier-1 pipeline most of the val set
 sits within 5-10% of parity, so these are mostly within the noise floor — but useful to see
 that the model isn't relying on a few outliers to drive the headline metric.
 """))

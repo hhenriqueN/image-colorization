@@ -36,7 +36,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import AB_MAX, DEFAULT_PROCESSED_DIR, ColorizationDataset, lab_to_rgb  # noqa: E402
-from src.data.quantize import annealed_mean, bilateral_smooth_ab  # noqa: E402
+from src.data.quantize import (  # noqa: E402
+    annealed_mean,
+    bilateral_smooth_ab,
+    guided_smooth_ab,
+    top_k_annealed_mean,
+)
 from src.models.resnet_unet import ResNetUNet  # noqa: E402
 from src.models.resnet_unet_cls import ResNetUNetClassifier  # noqa: E402
 
@@ -121,13 +126,24 @@ def build_sample_grid(
     bilateral_d: int = 9,
     bilateral_sigma_color: float = 15.0,
     bilateral_sigma_space: float = 9.0,
+    top_k: int | None = None,
+    use_guided: bool = False,
+    guided_radius: int = 8,
+    guided_eps: float = 1.0,
+    tta: bool = False,
+    ab_boost: float = 1.0,
 ) -> np.ndarray:
     """Build a 3-column grid (gray | predicted | truth).
 
     If `bin_centers` is provided, the model is treated as a classifier and the
-    logits are converted to ab via annealed-mean. `bilateral=True` additionally
-    smooths the per-image ab output with `bilateral_smooth_ab` — useful when
-    using low temperature (T ≲ 0.15) where discrete-bin patchiness shows up.
+    logits are converted to ab via annealed-mean (or top-k truncated annealed-mean
+    when `top_k` is set). `bilateral=True` or `use_guided=True` additionally
+    smooths the ab channels — `use_guided=True` (with L as guide) preserves
+    luminance edges better than the plain bilateral. `tta=True` averages logits
+    over the original and horizontally-flipped input.
+
+    `ab_boost` multiplies the decoded ab in [-1, 1] space before lab→rgb;
+    1.0 means no boost.
     """
     model.eval()
     is_classifier = bin_centers is not None
@@ -136,18 +152,30 @@ def build_sample_grid(
         l_tensor, ab_true = dataset[idx]
         l_in = l_tensor.unsqueeze(0).to(device)
         out = model(l_in)
+        if tta:
+            out_flipped = model(torch.flip(l_in, dims=[-1]))
+            out = (out + torch.flip(out_flipped, dims=[-1])) / 2.0
         if is_classifier:
-            ab_lab = annealed_mean(out, bin_centers, temperature)  # (1, 2, H, W) in LAB units
-            if bilateral:
+            if top_k is not None:
+                ab_lab = top_k_annealed_mean(out, bin_centers, temperature, k=top_k)
+            else:
+                ab_lab = annealed_mean(out, bin_centers, temperature)  # (1, 2, H, W) LAB units
+            if use_guided:
+                ab_lab = guided_smooth_ab(
+                    ab_lab, l_in, radius=guided_radius, eps=guided_eps,
+                )
+            elif bilateral:
                 ab_lab = bilateral_smooth_ab(
                     ab_lab,
                     diameter=bilateral_d,
                     sigma_color=bilateral_sigma_color,
                     sigma_space=bilateral_sigma_space,
                 )
-            ab_pred = (ab_lab / AB_MAX).cpu().squeeze(0).clamp(-1, 1)
+            ab_pred = (ab_lab / AB_MAX).cpu().squeeze(0)
         else:
-            ab_pred = out.cpu().squeeze(0).clamp(-1, 1)
+            ab_pred = out.cpu().squeeze(0)
+
+        ab_pred = (ab_pred * ab_boost).clamp(-1, 1)
 
         gray_panel = _grayscale_rgb_from_l(l_tensor)
         pred_panel = lab_to_rgb(l_tensor, ab_pred)
