@@ -161,6 +161,93 @@ def annealed_mean(
     return torch.einsum("nqhw,qc->nchw", probs, bin_centers)
 
 
+def top_k_annealed_mean(
+    logits: torch.Tensor,
+    bin_centers: torch.Tensor,
+    temperature: float = 0.10,
+    k: int = 10,
+) -> torch.Tensor:
+    """Annealed-mean restricted to the top-k bins per pixel.
+
+    Plain `annealed_mean` over all Q bins still spreads mass across low-chroma
+    tail bins, which pulls the decoded ab toward gamut center. Truncating to
+    top-k before averaging removes that pull — the decode commits to the vivid
+    modes the model actually believes in, without the patchiness of pure argmax.
+
+    Parameters
+    ----------
+    logits      : Tensor (N, Q, H, W).
+    bin_centers : Tensor (Q, 2) in LAB units.
+    temperature : softmax temperature applied to the top-k logits.
+    k           : number of top bins to keep per pixel.
+
+    Returns
+    -------
+    ab_lab : Tensor (N, 2, H, W) in LAB units.
+    """
+    bin_centers = bin_centers.to(logits.device, logits.dtype)
+    topk_logits, topk_idx = logits.topk(k, dim=1)            # (N, k, H, W)
+    probs = F.softmax(topk_logits / temperature, dim=1)       # k-way only
+    centers_a = bin_centers[:, 0][topk_idx]                   # (N, k, H, W)
+    centers_b = bin_centers[:, 1][topk_idx]                   # (N, k, H, W)
+    ab_a = (probs * centers_a).sum(dim=1)                     # (N, H, W)
+    ab_b = (probs * centers_b).sum(dim=1)
+    return torch.stack([ab_a, ab_b], dim=1)                   # (N, 2, H, W)
+
+
+def guided_smooth_ab(
+    ab_lab: torch.Tensor,
+    l_norm: torch.Tensor,
+    radius: int = 8,
+    eps: float = 1.0,
+) -> torch.Tensor:
+    """L-guided edge-aware smoothing of ab via `cv2.ximgproc.guidedFilter`.
+
+    Plain bilateral on ab alone doesn't know where luminance edges are, so
+    chroma bleeds across object boundaries. The guided filter uses the L
+    channel as a guide image so chroma transitions snap to actual structure.
+
+    Requires `opencv-contrib-python` (for the `ximgproc` namespace).
+
+    Parameters
+    ----------
+    ab_lab : Tensor (N, 2, H, W) in LAB units (any device).
+    l_norm : Tensor (N, 1, H, W) — L channel in the dataset's normalized
+             [-1, 1] range. Used as the per-image guide.
+    radius : filter radius in pixels.
+    eps    : regularization parameter; smaller = more edge preservation.
+             Operates on uint8 guide so eps≈1–100 is the useful range.
+
+    Returns
+    -------
+    ab_lab_smoothed : Tensor (N, 2, H, W) on the same device/dtype as input.
+    """
+    import cv2  # local import: opencv-contrib-python required for ximgproc
+
+    if ab_lab.dim() != 4 or ab_lab.shape[1] != 2:
+        raise ValueError(f"ab_lab must be (N, 2, H, W); got {tuple(ab_lab.shape)}")
+    if l_norm.dim() != 4 or l_norm.shape[1] != 1:
+        raise ValueError(f"l_norm must be (N, 1, H, W); got {tuple(l_norm.shape)}")
+    if l_norm.shape[0] != ab_lab.shape[0] or l_norm.shape[-2:] != ab_lab.shape[-2:]:
+        raise ValueError("l_norm and ab_lab must share batch + spatial dims")
+
+    device, dtype = ab_lab.device, ab_lab.dtype
+    l_u8 = ((l_norm + 1.0) / 2.0 * 255.0).clamp(0, 255).detach().cpu().to(torch.uint8).numpy()  # (N, 1, H, W)
+    ab_np = ab_lab.detach().cpu().to(torch.float32).numpy()  # (N, 2, H, W)
+
+    smoothed = np.empty_like(ab_np)
+    for n in range(ab_np.shape[0]):
+        guide = l_u8[n, 0]  # (H, W) uint8
+        for c in range(2):
+            smoothed[n, c] = cv2.ximgproc.guidedFilter(
+                guide=guide,
+                src=ab_np[n, c],
+                radius=radius,
+                eps=eps,
+            )
+    return torch.from_numpy(smoothed).to(device=device, dtype=dtype)
+
+
 def bilateral_smooth_ab(
     ab_lab: torch.Tensor,
     diameter: int = 9,

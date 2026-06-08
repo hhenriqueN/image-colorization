@@ -89,6 +89,7 @@ class SmpTrainConfig:
     bin_centers_path: Path | None = None
     rebalance_weights_path: Path | None = None
     colorfulness_subset: int = 64
+    unfreeze_after: int | None = None
 
 
 def parse_args() -> SmpTrainConfig:
@@ -134,6 +135,8 @@ def parse_args() -> SmpTrainConfig:
                    help="Path to precomputed class rebalance weights (Q,) npy — cls phase.")
     p.add_argument("--colorfulness-subset", type=int, default=64,
                    help="N val images for Hasler-Süsstrunk colorfulness logging — cls phase.")
+    p.add_argument("--unfreeze-after", type=int, default=None,
+                   help="Epoch number (0-indexed) after which to unfreeze encoder.layer4 — cls phase.")
     args = p.parse_args()
 
     return SmpTrainConfig(
@@ -161,6 +164,7 @@ def parse_args() -> SmpTrainConfig:
         bin_centers_path=args.bin_centers,
         rebalance_weights_path=args.rebalance_weights,
         colorfulness_subset=args.colorfulness_subset,
+        unfreeze_after=args.unfreeze_after,
     )
 
 
@@ -635,8 +639,11 @@ def train_smp_cls(cfg: SmpTrainConfig, device: torch.device) -> None:
             freeze_encoder=cfg.freeze_encoder,
             map_location=device,
         ).to(device)
-        print(f"[train-smp-cls] warm-started encoder/decoder from {cfg.warm_start} "
-              f"(new {num_classes}-way head is random-init)")
+        # Head transferred iff checkpoint num_classes matches; otherwise random-init.
+        head_w = model.unet.segmentation_head[0].weight
+        head_loaded = head_w.abs().mean().item() > 1e-5  # rough heuristic: trained heads aren't ~0
+        print(f"[train-smp-cls] warm-started from {cfg.warm_start} "
+              f"(head {'transferred' if head_loaded else 'random-init'})")
     else:
         model = SmpUNetClassifier(
             num_classes=num_classes, freeze_encoder=cfg.freeze_encoder
@@ -667,6 +674,15 @@ def train_smp_cls(cfg: SmpTrainConfig, device: torch.device) -> None:
     run_start = time.perf_counter()
 
     for epoch in range(start_epoch, cfg.epochs + 1):
+        if cfg.unfreeze_after is not None and epoch == cfg.unfreeze_after + 1:
+            model.unfreeze_last_block()
+            optimizer = torch.optim.AdamW(_trainable_params(model), lr=cfg.lr)
+            print(
+                f"[train-smp-cls] unfroze encoder.layer4 at epoch {epoch}; "
+                f"rebuilt optimizer at lr={cfg.lr}",
+                flush=True,
+            )
+
         lr_now = cosine_lr(cfg.lr, epoch - 1, cfg.epochs, decay_start)
         set_lr(optimizer, lr_now)
 

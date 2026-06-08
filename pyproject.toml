@@ -13,6 +13,7 @@ dependencies = [
     "pillow>=10.0",
     "numpy>=1.24",
     "scikit-image>=0.21",
+    "opencv-contrib-python>=4.8",
     "pandas>=2.0",
     "tqdm>=4.65",
     "ipykernel>=7.2.0",

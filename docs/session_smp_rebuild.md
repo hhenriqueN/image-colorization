@@ -321,7 +321,104 @@ all of `src/models/{resnet_unet,resnet_unet_cls,unet,discriminator}.py`.
 | Phase 3 final sample (Zhang cls) | `outputs/samples/smp_cls_run01/epoch_010.png` | "Loss change broke the attractor" |
 | 5-phase visual comparison (rendered) | `notebooks/05_smp_compare.ipynb` § 6 | Side-by-side hero |
 | Colorfulness ratio vs epoch | `notebooks/06_smp_cls_showcase.ipynb` § 3 | Metric story |
-| ab-boost ablation visual | `notebooks/06_smp_cls_showcase.ipynb` § 8 | Cheap-win demo |
-| ab-boost sweep chart | `notebooks/06_smp_cls_showcase.ipynb` § 9 | Boost-vs-ratio curve |
+| ab-boost ablation visual | `notebooks/06_smp_cls_showcase.ipynb` § 7 | Cheap-win demo |
+| ab-boost sweep chart | `notebooks/06_smp_cls_showcase.ipynb` § 8 | Boost-vs-ratio curve |
+| Best/worst-match leaderboards | `notebooks/06_smp_cls_showcase.ipynb` § 9 | Per-metric champions |
 
 Open the executed notebooks once, screenshot the rendered figures, drop into slides.
+
+---
+
+## 16. Session 2 — 24-hour quality push (Tier 1 honest results)
+
+After Phase 3 merged, we did a 24-hour follow-up to push model quality further. The plan
+synthesized two AI brainstorms (mine + Claude Desktop's) into three execution tiers.
+
+### Tier 1 — inference-only fixes (DONE)
+
+Three changes added to the inference path, each independently testable:
+
+1. **Top-k truncated annealed-mean** (`src/data/quantize.py:top_k_annealed_mean`) — drops
+   low-chroma tail bins before averaging, theoretically removing the gray-pull.
+2. **L-guided edge-aware smoothing** (`src/data/quantize.py:guided_smooth_ab`, requires
+   `opencv-contrib-python`) — uses the L channel as a guide so chroma transitions snap to
+   real luminance edges.
+3. **Test-time augmentation** (h-flip ensemble) — average logits over original + flipped input.
+
+**Empirical reality:**
+
+| Recipe | Native colorfulness ratio |
+|---|---|
+| OLD: full annealed-mean + bilateral, no boost | 0.78 |
+| OLD + boost ×1.20 (original Phase 3 ship) | 0.94 |
+| + top-k=10 (no boost) | 0.78 (no-op at T=0.10 — softmax is already peaky) |
+| + L-guided filter (no boost) | 0.76 (slightly desaturated this checkpoint) |
+| + TTA (no boost) | 0.74 (slightly hurt) |
+| **top-1 (argmax) + bilateral, no boost** | **0.81** |
+| **top-1 + bilateral + boost ×1.10  ← NEW DEFAULT** | **0.89** |
+
+The honest takeaway: the post-hoc ab boost was doing real work the inference tweaks
+couldn't replace. The marginal win is replacing soft annealed-mean with top-1 (argmax),
+which lets us reduce the boost from ×1.20 to ×1.10 for similar saturation at less
+artificial pressure. **The remaining saturation gap is a training-side problem.**
+
+### Tier 2 — last-block encoder fine-tune (DONE, net-negative)
+
+A 3-epoch continuation from `smp_cls_run01/best.pth` with `encoder.layer4` unfrozen at
+lr=1e-5. 2h 13m wall on M4 MPS, output in `checkpoints/smp_cls_run01_ft/`.
+
+**Result: slight regression on colorfulness, flat on val_ce.**
+
+| | Phase 3 baseline | Tier 2 fine-tune | Δ |
+|---|---|---|---|
+| best val_ce | 3.359 | 3.372 | +0.013 |
+| final val_l1 | 0.0774 | 0.0767 | -0.0007 |
+| Hasler ratio (best recipe) | 0.893 | 0.829 | **-0.064** |
+
+The fine-tune marginally improved L1 (moving the prediction *toward* the dataset mean,
+which is sepia) and lost colorfulness across the board. The encoder adaptation didn't
+fix the under-commitment in the model's logits — it slightly worsened it.
+
+**Decision:** keep Phase 3 baseline as the shipped checkpoint. Tier 2 checkpoint stays
+in the repo for transparency but isn't the default in the showcase notebook.
+
+### Tier 3 — Honest reframings (DONE)
+
+Three points worth making explicit in the deck:
+
+1. **PSNR 21.86 / SSIM 0.904 are normal for colorization, not mediocre.** Both metrics
+   penalize plausible-but-different colorings the same way L1 did at the start. Track
+   native Hasler-Süsstrunk colorfulness instead.
+2. **Graphics / logos / artificial paint are structurally unsolvable** without user
+   hints. A gray logo carries no luminance signal about color. Naturalistic-prior
+   fallback is correct behavior, not a defect.
+3. **Inference tweaks have a ceiling.** The decode/smooth/TTA stack moved native
+   colorfulness ~0.03. Beyond that is a training-side or architectural lift.
+
+### Tier 4 — Skipped
+
+Tier 2 showed that more training of the same architecture with the same rebalanced CE
+recipe doesn't help — and slightly hurts. A fresh ResNet-50 retrain would burn 8h of
+overnight compute on the same flawed loss/data combination. Better future levers:
+
+- **Stronger rebalancing** (Zhang λ=0.5 → 0.9): increase the rare-color emphasis directly.
+- **Domain narrowing** (landscapes / faces / single category): smaller conditional variance
+  means the L1 mean isn't catastrophically gray.
+- **User-guided hints** (Zhang 2017): the only principled fix for arbitrary-graphics
+  colorization; biggest demo lever.
+- **Direct chroma magnitude loss term**: penalize under-saturation in training, not just
+  in inference.
+
+### Lessons added from Session 2
+
+- **Inference-time theories don't always survive contact with real model logits.** At
+  T=0.10 the soft annealed-mean is already concentrated enough that top-k≥5 truncation
+  is a no-op. The expected "tail mass pulls toward gray" effect was negligible on this
+  checkpoint.
+- **Guided filter ≠ universally better than bilateral on chroma.** With this model's
+  patchy argmax output, the L-guided edge-snapping actually *desaturated* slightly because
+  the edge regions had higher chroma than the interiors it smoothed toward.
+- **The post-hoc ab boost is doing useful work, not just covering a flaw.** It compensates
+  for a real under-commitment in the model's logits — which is a training-side issue
+  (probably under-aggressive class rebalancing on the original training distribution).
+  Killing the boost means retraining, not retuning.
