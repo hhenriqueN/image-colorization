@@ -435,48 +435,7 @@ per_img_df
 """))
 
     cells.append(md("""
-## 7. Per-epoch training-time sample evolution
-
-Eight fixed validation images watched across all 10 epochs. Same grid format the model used
-during training (gray | predicted | truth). Scrub through the epochs to see when the
-saturation breakthrough kicked in — usually around epoch 3–5 for this recipe.
-"""))
-
-    cells.append(code("""
-def show_grid_with_labels(path: Path, title: str) -> None:
-    if not path.exists():
-        print(f\"=== {title}: NOT FOUND at {path} ===\")
-        return
-    img = np.array(Image.open(path))
-    h, w = img.shape[:2]
-    col_w = (w - 8) / 3
-    col_centers = [col_w / 2, col_w + 4 + col_w / 2, 2 * col_w + 8 + col_w / 2]
-    labels = [
-        (\"INPUT\\n(B&W)\",            \"#444444\"),
-        (\"GENERATED\\n(model out)\",  \"#ff7f0e\"),
-        (\"REAL\\n(ground truth)\",    \"#2ca02c\"),
-    ]
-    fig_h = 12 * h / w
-    fig, ax = plt.subplots(figsize=(9, fig_h))
-    ax.imshow(img)
-    ax.set_xticks([]); ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    for cx, (lbl, color) in zip(col_centers, labels):
-        ax.text(cx, -h * 0.012, lbl, ha=\"center\", va=\"bottom\",
-                fontsize=11, weight=\"bold\", color=color)
-    ax.set_title(title, fontsize=12, weight=\"bold\", pad=42)
-    plt.tight_layout()
-    plt.show()
-
-sample_dir = PROJECT_ROOT / \"outputs\" / \"samples\" / \"smp_cls_run01\"
-for ep in range(1, 11):
-    path = sample_dir / f\"epoch_{ep:03d}.png\"
-    show_grid_with_labels(path, f\"Phase 3 — epoch {ep}/10\")
-"""))
-
-    cells.append(md("""
-## 8. ab-channel boost ablation (kept as a tweaking lever)
+## 7. ab-channel boost ablation (kept as a tweaking lever)
 
 Originally this section picked the `×1.20` boost for the OLD Phase 3 pipeline. With the
 Tier 1 stack (top-k + L-guided + TTA, section 4b) the model commits to vivid colors
@@ -536,7 +495,7 @@ plt.show()
 """))
 
     cells.append(md("""
-## 9. Boost factor sweep — achieved colorfulness ratio
+## 8. Boost factor sweep — achieved colorfulness ratio
 
 A finer sweep computed on all 12 showcase images. Shows where each boost factor lands the
 mean Hasler-Süsstrunk ratio. The recommended boost is the one whose ratio is closest to
@@ -585,7 +544,7 @@ else:
 """))
 
     cells.append(md("""
-## 10. Best matches — which val images did the model nail?
+## 9. Best matches — which val images did the model nail?
 
 Computes four similarity metrics on a 200-image deterministic val sample (seed=42), all using
 the Tier-1 inference recipe (top-k + L-guided + TTA, no boost):
@@ -633,7 +592,7 @@ print(f\"mean L1_rgb={eval_df['l1_rgb'].mean():.2f}  median={eval_df['l1_rgb'].m
 print(f\"mean colorfulness_ratio={eval_df['colorfulness_ratio'].mean():.3f}\")
 """))
 
-    cells.append(md("### 10.1 Leaderboards (top-12 per metric)"))
+    cells.append(md("### 9.1 Leaderboards (top-12 per metric)"))
 
     cells.append(code("""
 from IPython.display import display
@@ -653,7 +612,7 @@ display(eval_df.nsmallest(K, \"colorfulness_ratio_abs_err\")[[\"idx\", \"psnr\",
 """))
 
     cells.append(md("""
-### 10.2 Visual — Top-8 by PSNR (pixel-fidelity champions)
+### 9.2 Visual — Top-8 by PSNR (pixel-fidelity champions)
 
 These are the val images where the model's predicted RGB best matched ground truth pixel-by-pixel.
 Expect tasteful, natural-looking colorizations — PSNR rewards getting the *right* color, not
@@ -692,7 +651,7 @@ render_top_grid(eval_df.nlargest(8, \"psnr\")[\"idx\"].tolist(), \"by PSNR\")
 """))
 
     cells.append(md("""
-### 10.3 Visual — Top-8 by SSIM (structural-similarity champions)
+### 9.3 Visual — Top-8 by SSIM (structural-similarity champions)
 
 These reward perceptual structure: the model put colors in the right *regions* even if the
 exact shade is off. Some overlap with the PSNR leaders is expected.
@@ -703,7 +662,7 @@ render_top_grid(eval_df.nlargest(8, \"ssim\")[\"idx\"].tolist(), \"by SSIM\")
 """))
 
     cells.append(md("""
-### 10.4 Visual — Top-8 by colorfulness ratio closest to 1.0
+### 9.4 Visual — Top-8 by colorfulness ratio closest to 1.0
 
 These are the images where saturation parity is tightest. With the Tier-1 pipeline most of the val set
 sits within 5-10% of parity, so these are mostly within the noise floor — but useful to see
@@ -716,7 +675,7 @@ render_top_grid(eval_df.nsmallest(8, \"colorfulness_ratio_abs_err\")[\"idx\"].to
 """))
 
     cells.append(md("""
-### 10.5 Visual — Worst-8 by PSNR (for diagnostic context)
+### 9.5 Visual — Worst-8 by PSNR (for diagnostic context)
 
 For comparison: the val images the model handled *worst* by pixel fidelity. Looking at these
 shows where the failure modes still live — usually graphics, bright artificial colors, or

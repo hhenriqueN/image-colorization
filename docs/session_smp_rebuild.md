@@ -321,8 +321,9 @@ all of `src/models/{resnet_unet,resnet_unet_cls,unet,discriminator}.py`.
 | Phase 3 final sample (Zhang cls) | `outputs/samples/smp_cls_run01/epoch_010.png` | "Loss change broke the attractor" |
 | 5-phase visual comparison (rendered) | `notebooks/05_smp_compare.ipynb` § 6 | Side-by-side hero |
 | Colorfulness ratio vs epoch | `notebooks/06_smp_cls_showcase.ipynb` § 3 | Metric story |
-| ab-boost ablation visual | `notebooks/06_smp_cls_showcase.ipynb` § 8 | Cheap-win demo |
-| ab-boost sweep chart | `notebooks/06_smp_cls_showcase.ipynb` § 9 | Boost-vs-ratio curve |
+| ab-boost ablation visual | `notebooks/06_smp_cls_showcase.ipynb` § 7 | Cheap-win demo |
+| ab-boost sweep chart | `notebooks/06_smp_cls_showcase.ipynb` § 8 | Boost-vs-ratio curve |
+| Best/worst-match leaderboards | `notebooks/06_smp_cls_showcase.ipynb` § 9 | Per-metric champions |
 
 Open the executed notebooks once, screenshot the rendered figures, drop into slides.
 
