@@ -30,17 +30,56 @@ didn't work end-to-end on Kaggle):
   saturation breakthrough** — same weights produce visibly more vivid output than
   Phase A/B (Capitol gets blue sky, apple goes vivid red, boats become cyan).
 
-The main deliverable is `notebooks/04_compare_results.ipynb`, executed in-place with a
-5-column visual grid comparing all three phases against ground truth on held-out val
-images. The full journey log (Kaggle pivot, NaN-on-MPS bug, per-cycle metrics, honest
-assessment of failures) lives in `docs/local_training_log.md`.
+The main deliverable for the legacy track is `notebooks/04_compare_results.ipynb`,
+executed in-place with a 5-column visual grid comparing all three phases against ground
+truth on held-out val images. The full journey log (Kaggle pivot, NaN-on-MPS bug,
+per-cycle metrics, honest assessment of failures) lives in `docs/local_training_log.md`.
+
+### smp Rebuild Track (Phases 1/2/3 — current shipped pipeline)
+
+After the legacy Phase C, an external research conversation prompted a parallel rebuild
+on `feat/smp-rebuild` using `segmentation_models_pytorch` as the one-liner backbone:
+
+- **Phase 1** (`checkpoints/smp_l1_run01/best.pth`): `smp.Unet(resnet34, imagenet)` with
+  frozen encoder + from-scratch decoder, pure L1. 10K subset, 12 ep, `val_l1=0.0727`.
+- **Phase 2** (`checkpoints/smp_cgan_run01/best_generator.pth`): same generator
+  warm-started + PatchGAN with d-step-every=2 collapse guard. 10K subset, 6 ep,
+  `val_l1=0.0752`. Output still sepia-leaning — confirms the loss-function bottleneck.
+- **Phase 3** (`checkpoints/smp_cls_run01/best.pth`): same encoder/decoder swapped to a
+  214-way Zhang classification head with rebalanced CE. 50K subset, 10 ep,
+  `val_ce=3.359`, native colorfulness 0.70.
+- **24-hour quality push** (Tier 1+2): inference tweaks (`top_k_annealed_mean`,
+  `guided_smooth_ab`, TTA) + 3-epoch encoder.layer4 fine-tune. Honest result: tweaks
+  mostly no-op, fine-tune was net-negative. The single marginal win is replacing soft
+  annealed-mean with top-1 (argmax) decode, which lets `ab × 1.10` match the original
+  `× 1.20` saturation at less artificial pressure.
+
+**Shipped inference recipe** (used in `notebooks/06_smp_cls_showcase.ipynb`):
+
+```
+ab_lab = top_k_annealed_mean(logits, bin_centers, T=0.10, k=1)   # argmax decode
+ab_lab = bilateral_smooth_ab(ab_lab, ...)                         # patch cleanup
+ab     = (ab_lab / 128 * 1.10).clamp(-1, 1)                       # ×1.10 boost
+```
+
+Hasler-Süsstrunk **colorfulness ratio is the headline metric** (PSNR/SSIM are
+anti-correlated with plausible-but-different colorings; track them only as side dishes).
+
+Deliverables for the smp track:
+- `notebooks/06_smp_cls_showcase.ipynb` — Phase 3 deep-dive, recipe ablation (§4b),
+  best/worst-match leaderboards (§9)
+- `notebooks/05_smp_compare.ipynb` — 5-column visual comparison across all smp phases
+- `docs/PROGRESS.md` — team-facing one-pager
+- `docs/session_smp_rebuild.md` — slide-by-slide writeup (§16 covers the 24-hour push)
 
 ## Stack (actual)
 
 - Python 3.12 (pinned via `.python-version`), `uv` for env + dep management
 - PyTorch 2.11 + torchvision, MPS backend on M4 (`PYTORCH_ENABLE_MPS_FALLBACK=1`)
+- `segmentation_models_pytorch>=0.3.4` — smp rebuild backbone (`smp.Unet`)
+- `opencv-contrib-python>=4.8` — `cv2.ximgproc.guidedFilter` for L-guided ab smoothing
 - scikit-image (RGB↔LAB), Pillow (image I/O), pandas + numpy, matplotlib for plots
-- nbformat + jupyter nbconvert to programmatically build and execute the comparison notebook
+- nbformat + jupyter nbconvert to programmatically build and execute notebooks
 
 ## Data Pipeline
 
@@ -101,25 +140,38 @@ image-colorization/
 │   ├── 01_unet.ipynb / 01_unet_kaggle.ipynb              # legacy, dropped
 │   ├── 02_resnet_unet.ipynb / 02_resnet_unet_kaggle.ipynb  # legacy Kaggle source
 │   ├── 03_cgan.ipynb / 03_cgan_kaggle.ipynb              # legacy Kaggle source
-│   └── 04_compare_results.ipynb                          # MAIN deliverable, executed
+│   ├── 04_compare_results.ipynb                          # legacy A/B/C comparison
+│   ├── 05_smp_compare.ipynb                              # smp Phase 1/2/3 comparison
+│   └── 06_smp_cls_showcase.ipynb                         # smp Phase 3 deep-dive (MAIN)
 ├── scripts/
 │   ├── download_dataset.py preprocess_images.py          # data pipeline
 │   ├── make_kaggle_notebooks.py                          # legacy Kaggle adapter
 │   ├── check_mps.py                                      # MPS sanity check
-│   ├── train.py                                          # headless CLI, all 3 model kinds
+│   ├── train.py                                          # legacy CLI (A/B/C)
+│   ├── train_smp.py                                      # smp rebuild CLI (Phases 1/2/3)
 │   ├── generate_samples.py compare_checkpoints.py        # visual eval
-│   ├── precompute_classification_priors.py               # Phase C: build ab gamut + weights
-│   └── build_compare_notebook.py                         # rebuild notebook 04
+│   ├── precompute_classification_priors.py               # Zhang: build ab gamut + weights
+│   ├── build_compare_notebook.py                         # rebuild notebook 04 (legacy)
+│   ├── build_smp_compare_notebook.py                     # rebuild notebook 05
+│   └── build_smp_cls_showcase_notebook.py                # rebuild notebook 06
 ├── src/
 │   ├── data/dataset.py                                   # ColorizationDataset (RGB→LAB)
-│   ├── data/quantize.py                                  # Phase C: bins + annealed-mean
+│   ├── data/quantize.py                                  # Zhang bins + annealed-mean
+│   │                                                       # + top_k_annealed_mean (Tier 1)
+│   │                                                       # + guided_smooth_ab (Tier 1)
 │   ├── losses/perceptual.py                              # VGG perceptual loss (NaN-safe MPS)
+│   ├── metrics/colorfulness.py                           # Hasler-Süsstrunk (headline metric)
 │   └── models/
 │       ├── unet.py                                       # legacy Phase 1, unused
-│       ├── resnet_unet.py                                # Phase A/B model
-│       ├── resnet_unet_cls.py                            # Phase C classifier head
-│       └── discriminator.py                              # Phase B PatchGAN
-├── docs/local_training_log.md                            # full journey + metrics
+│       ├── resnet_unet.py                                # legacy Phase A/B model
+│       ├── resnet_unet_cls.py                            # legacy Phase C classifier head
+│       ├── smp_unet.py                                   # smp Phase 1/2 generator
+│       ├── smp_unet_cls.py                               # smp Phase 3 classifier head
+│       └── discriminator.py                              # PatchGAN (legacy B + smp 2)
+├── docs/
+│   ├── local_training_log.md                             # legacy A/B/C journey + metrics
+│   ├── PROGRESS.md                                       # team-facing TL;DR (smp rebuild)
+│   └── session_smp_rebuild.md                            # slide-by-slide writeup (smp track)
 ├── checkpoints/  outputs/                                # gitignored training artifacts
 ├── pyproject.toml  .python-version                       # uv-managed, Python 3.12
 └── README.md  CLAUDE.md                                  # public + Claude-facing docs
